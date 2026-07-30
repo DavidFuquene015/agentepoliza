@@ -1,0 +1,53 @@
+# ============================================================
+#  colvatel.service — Servicio systemd de la aplicación.
+# ============================================================
+#  QUÉ HACE: convierte la app en un servicio permanente de Ubuntu.
+#  Arranca sola al encender el servidor, se reinicia sola si se
+#  cae, y se administra con systemctl.
+#
+#  INSTALACIÓN (una sola vez, en el servidor):
+#    sudo cp deploy/colvatel.service /etc/systemd/system/
+#    sudo systemctl daemon-reload
+#    sudo systemctl enable --now colvatel
+#
+#  USO DIARIO:
+#    sudo systemctl status|start|stop|restart colvatel
+#    journalctl -u colvatel -f          (ver logs en vivo)
+# ============================================================
+
+[Unit]
+Description=Colvatel - Agente de Aprobacion de Polizas (Gunicorn)
+# Arrancar solo cuando la red y MySQL ya estén listos.
+After=network.target mysql.service
+Wants=mysql.service
+
+[Service]
+Type=notify
+# Usuario SIN privilegios dedicado a la app (más seguro que root).
+# Crearlo antes con:  sudo adduser --system --group colvatel
+User=colvatel
+Group=colvatel
+
+# Carpeta del proyecto en el servidor. Desde aquí python-dotenv
+# encuentra y carga el archivo .env automáticamente.
+WorkingDirectory=/opt/colvatel-app
+
+# El comando que ejecuta la app: Gunicorn (servidor de producción)
+# con la configuración de gunicorn.conf.py y la entrada wsgi.py.
+ExecStart=/opt/colvatel-app/venv/bin/gunicorn -c gunicorn.conf.py wsgi:app
+
+# Si la app se cae por un error, systemd la revive a los 5 segundos.
+Restart=on-failure
+RestartSec=5
+
+# ── Blindaje de seguridad ────────────────────────────────────
+NoNewPrivileges=true          # el proceso no puede escalar permisos
+PrivateTmp=true               # /tmp aislado (los Excel temporales quedan protegidos)
+ProtectSystem=full            # el sistema operativo queda de solo-lectura para la app
+ProtectHome=true              # sin acceso a las carpetas personales de otros usuarios
+# OJO: si DOCUMENT_STORAGE_ROOT apunta FUERA de /opt/colvatel-app,
+# añade aquí:  ReadWritePaths=/ruta/de/esa/carpeta
+
+[Install]
+# Activa el arranque automático al encender el servidor.
+WantedBy=multi-user.target

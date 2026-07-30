@@ -1,0 +1,66 @@
+# ============================================================
+#  nginx.conf.example — Proxy inverso Nginx de la aplicación.
+# ============================================================
+#  QUÉ HACE: Nginx es la "puerta de entrada" del servidor. Recibe
+#  a los usuarios en el puerto 80/443 y les reenvía las peticiones
+#  a Gunicorn (que corre interno en 127.0.0.1:5000). También
+#  entrega los archivos estáticos (css/js) directamente, más rápido.
+#
+#  INSTALACIÓN (una sola vez, en el servidor):
+#    sudo cp deploy/nginx.conf.example /etc/nginx/sites-available/colvatel
+#    sudo nano /etc/nginx/sites-available/colvatel   (ajustar server_name)
+#    sudo ln -s /etc/nginx/sites-available/colvatel /etc/nginx/sites-enabled/
+#    sudo nginx -t && sudo systemctl reload nginx
+# ============================================================
+
+server {
+    # Puerto de entrada HTTP (Certbot añadirá el 443/HTTPS después).
+    listen 80;
+
+    # CAMBIAR: dominio o IP con que se accederá a la app.
+    server_name tu-dominio-o-ip;   # p. ej. polizas.colvatel.local
+
+    # Tamaño máximo de subida. La app acepta hasta 50 MB por análisis
+    # (contrato + pólizas); se deja margen. Sin esto, Nginx rechazaría
+    # archivos de más de 1 MB con error 413.
+    client_max_body_size 55M;
+
+    # Los archivos estáticos (css/js) los entrega Nginx directamente,
+    # sin pasar por Python: más rápido y con caché de 30 días.
+    location /static/ {
+        alias /opt/colvatel-app/static/;
+        expires 30d;
+        access_log off;
+    }
+
+    # Todo lo demás se reenvía a Gunicorn (la app Flask).
+    location / {
+        proxy_pass http://127.0.0.1:5000;
+        # Cabeceras para que la app conozca al visitante real
+        # (IP de origen, protocolo http/https, dominio pedido).
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Esperar hasta 3 minutos la respuesta: los análisis con IA
+        # tardan. Alineado con el timeout de gunicorn.conf.py.
+        proxy_read_timeout 180s;
+        proxy_send_timeout 180s;
+    }
+}
+
+# ── HTTPS (recomendado) ─────────────────────────────────────
+# Tras comprobar que funciona por HTTP, activa el certificado con:
+#   sudo apt install certbot python3-certbot-nginx
+#   sudo certbot --nginx -d tu-dominio
+# Certbot reescribe este archivo solo: sirve en 443 y redirige 80 → 443.
+#
+# ── Seguridad adicional (opcional pero recomendada) ─────────
+# La app NO tiene login propio. Para exigir usuario/contraseña desde
+# Nginx (protege especialmente /admin/apis), añade dentro de "location /":
+#   auth_basic "Colvatel - Acceso restringido";
+#   auth_basic_user_file /etc/nginx/.htpasswd;
+# y crea el usuario con:
+#   sudo apt install apache2-utils
+#   sudo htpasswd -c /etc/nginx/.htpasswd nombreusuario
