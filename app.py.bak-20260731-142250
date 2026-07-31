@@ -896,159 +896,9 @@ def _normalizar_datos_analisis(datos, texto_poliza: str | None = None):
     return datos
 
 
-# ── Recorte de texto para ahorrar tokens ─────────────────────
-# Los PDF de contratos y pólizas traen mucho texto que NO aporta ningún campo
-# al JSON y que se paga igual: la misma cabecera repetida en todas las páginas,
-# el clausulado general de la aseguradora (fisión nuclear, artículo 216 del
-# Código Sustantivo...) y páginas de texto legal sin un solo dato.
-# Quitarlo baja ~40% los tokens del análisis SIN perder información.
-#
-# REGLA DE ORO: ante la duda, se conserva la página. Una versión más agresiva
-# (descartar toda página sin números) ahorraba ~67% pero borraba la cláusula
-# «DURACIÓN Y VIGENCIA», donde vive la fecha de terminación del contrato —
-# escrita a veces como «hasta el 30de junio de 2026», sin ningún patrón
-# numérico detectable. Perder ese campo invalida TODAS las vigencias.
-#
-# Desactivar por completo:  RECORTE_TOKENS=0
-
-# Datos "duros": si aparecen en la página, la página se conserva sí o sí.
-_RE_DATO_DURO = re.compile(
-    r"\d{1,3}(?:[.,]\d{3}){2,}"                 # montos: 1.234.567
-    r"|\b\d{1,2}[/\-.]\d{1,2}[/\-.]\d{4}\b"     # fechas: 30/01/2026
-    r"|\b\d{1,2}\s?%"                           # porcentajes: 20%
-    r"|\b\d{2}-\d{2}-\d{6,}\b"                  # No. de póliza: 65-47-101017450
-    r"|\b\d{3}[.,]\d{3}[.,]\d{3}\b"             # NIT: 901.112.983
-)
-
-# Cifras escritas en letras y meses: cubren los casos que _RE_DATO_DURO no ve.
-_RE_NUM_LETRAS = re.compile(
-    r"(?i)\b(?:un|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce"
-    r"|quince|veinte|treinta|enero|febrero|marzo|abril|mayo|junio|julio|agosto"
-    r"|septiembre|octubre|noviembre|diciembre|mill[oó]n|millones|mil|por\s+ciento)\b"
-)
-
-# Encabezados de cláusula que SIEMPRE hay que conservar aunque no traigan cifras.
-_RE_CLAUSULA_CLAVE = re.compile(
-    r"(?i)duraci[oó]n\s+y\s+vigencia|valor\s+y\s+forma\s+de\s+pago|garant[ií]as?\s*:"
-    r"|liquidaci[oó]n|objeto\s*:|plazo\s+de\s+ejecuci[oó]n|amparo|p[oó]liza\s+de"
-)
-
-# Inicio del clausulado estándar de la aseguradora: a partir de ahí, todo el
-# resto del documento es articulado genérico igual en todas las pólizas.
-_RE_CLAUSULADO = re.compile(
-    r"(?i)condiciones\s+generales|clausulado\s+general|amparos\s+y\s+exclusiones"
-)
-
-
-def _recorte_activo() -> bool:
-    """True salvo que RECORTE_TOKENS esté explícitamente en 0."""
-    return os.environ.get("RECORTE_TOKENS", "1") != "0"
-
-
-def _quitar_cabeceras_repetidas(paginas: list[str], umbral: float = 0.6) -> list[str]:
-    """
-    Quita las líneas que se repiten en la mayoría de páginas (cabecera y pie).
-
-    Un contrato de 18 páginas repite su encabezado 18 veces (~250 chars cada
-    una). Se conserva cualquier línea que contenga un dato duro: el número de
-    póliza, por ejemplo, vive precisamente en la cabecera repetida.
-    """
-    if len(paginas) < 3:
-        return paginas
-    conteo: dict[str, int] = {}
-    for t in paginas:
-        # set() por página: una línea repetida DENTRO de la misma página cuenta una vez.
-        for ln in {l.strip() for l in t.splitlines() if len(l.strip()) > 12}:
-            conteo[ln] = conteo.get(ln, 0) + 1
-    minimo = max(2, int(len(paginas) * umbral))
-    repetidas = {
-        ln for ln, c in conteo.items()
-        if c >= minimo and not _RE_DATO_DURO.search(ln)
-    }
-    if not repetidas:
-        return paginas
-    return [
-        "\n".join(l for l in t.splitlines() if l.strip() not in repetidas)
-        for t in paginas
-    ]
-
-
-def _cortar_clausulado(paginas: list[str]) -> list[str]:
-    """
-    Descarta el clausulado general de la póliza y todo lo que venga después.
-
-    Solo corta si la página ANUNCIA el clausulado en su encabezado y además casi
-    no trae cifras: así no se descarta por error una carátula que mencione
-    "condiciones generales" de pasada.
-    """
-    for i, t in enumerate(paginas):
-        if _RE_CLAUSULADO.search(t[:600]) and len(_RE_DATO_DURO.findall(t)) <= 2:
-            return paginas[:i]
-    return paginas
-
-
-def _quitar_paginas_sin_datos(paginas: list[str]) -> list[str]:
-    """Descarta páginas sin cifras, sin cifras en letras y sin cláusula clave."""
-    fuera = []
-    for t in paginas:
-        if len(t) <= 300:                          # páginas casi vacías: no estorban
-            fuera.append(t)
-            continue
-        if (_RE_DATO_DURO.search(t)
-                or len(_RE_NUM_LETRAS.findall(t)) >= 3
-                or _RE_CLAUSULA_CLAVE.search(t)):
-            fuera.append(t)
-    return fuera
-
-
-def _recortar_paginas(paginas: list[str], etiqueta: str) -> tuple[str, int]:
-    """
-    Aplica las tres técnicas de recorte. Devuelve (texto, caracteres quitados).
-
-    Si algo sale mal, o si el recorte se dejara más del 90% del documento fuera
-    (señal de que las heurísticas no encajan con este formato), se devuelve el
-    texto íntegro: es preferible pagar de más que analizar un documento mutilado.
-    """
-    original = "\n".join(paginas)
-    if not _recorte_activo() or len(paginas) < 2:
-        return original, 0
-    try:
-        p = _quitar_cabeceras_repetidas(paginas)
-        p = _cortar_clausulado(p)
-        p = _quitar_paginas_sin_datos(p)
-        recortado = "\n".join(p)
-    except Exception:
-        logger.exception("Recorte de tokens falló en %s — se envía el texto completo", etiqueta)
-        return original, 0
-
-    if not recortado.strip() or len(recortado) < len(original) * 0.10:
-        logger.warning(
-            "Recorte descartado en %s: dejaría %s de %s chars (demasiado agresivo)",
-            etiqueta, len(recortado), len(original),
-        )
-        return original, 0
-
-    quitados = len(original) - len(recortado)
-    if quitados > 0:
-        # Sin flechas Unicode: el log puede acabar en una consola cp1252 (Windows).
-        logger.info(
-            "Recorte %-28s %s -> %s chars (-%s, %.0f%%) | paginas %s -> %s",
-            etiqueta[:28], len(original), len(recortado), quitados,
-            100 * quitados / len(original), len(paginas), len(p),
-        )
-    return recortado, quitados
-
-
-def extraer_texto_pdf(file_bytes, recortar: bool = False, etiqueta: str = "PDF",
-                      info_out: dict | None = None):
-    """
-    Extrae el texto de un PDF con pdfplumber. Devuelve cadena (casi) vacía si el PDF es una imagen escaneada sin texto seleccionable.
-
-    recortar=True aplica el recorte de tokens (solo en /api/analizar; el Manual
-    de Contratación se sube completo porque de ahí salen los % y los meses).
-    info_out acumula {'chars_quitados': N} entre varias llamadas.
-    """
-    paginas: list[str] = []
+def extraer_texto_pdf(file_bytes):
+    """Extrae el texto de un PDF con pdfplumber. Devuelve cadena (casi) vacía si el PDF es una imagen escaneada sin texto seleccionable."""
+    texto = ""
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
         tmp.write(file_bytes)
         tmp_path = tmp.name
@@ -1057,16 +907,9 @@ def extraer_texto_pdf(file_bytes, recortar: bool = False, etiqueta: str = "PDF",
             for page in pdf.pages:
                 t = page.extract_text()
                 if t:
-                    paginas.append(t)
+                    texto += t + "\n"
     finally:
         os.unlink(tmp_path)
-
-    if not recortar:
-        return "\n".join(paginas) + ("\n" if paginas else "")
-
-    texto, quitados = _recortar_paginas(paginas, etiqueta)
-    if info_out is not None and quitados:
-        info_out["chars_quitados"] = info_out.get("chars_quitados", 0) + quitados
     return texto
 
 
@@ -1896,17 +1739,10 @@ def analizar():
 
         bytes_contrato = archivo_contrato.read()
 
-        # Acumula los caracteres que el recorte quita en TODOS los documentos
-        # del análisis (contrato + pólizas), para informarlo en el resultado.
-        recorte_info: dict = {}
-
         def extraer(contenido, nombre):
             n = (nombre or "").lower()
             if n.endswith(".pdf"):
-                return extraer_texto_pdf(
-                    contenido, recortar=True, etiqueta=nombre or "PDF",
-                    info_out=recorte_info,
-                )
+                return extraer_texto_pdf(contenido)
             elif n.endswith(".docx"):
                 return extraer_texto_docx(contenido)
             return contenido.decode("utf-8", errors="ignore")
@@ -1927,24 +1763,6 @@ def analizar():
             return jsonify({"error": "No se pudo extraer texto del contrato. Verifica que el PDF no sea imagen escaneada."}), 400
         if len(texto_poliza) < 50:
             return jsonify({"error": "No se pudo extraer texto de la póliza. Verifica que el PDF no sea imagen escaneada."}), 400
-
-        # Informe del recorte: cuánto se dejó de enviar (y por tanto de pagar).
-        chars_quitados = recorte_info.get("chars_quitados", 0)
-        tokens_ahorrados = estimar_tokens("x" * chars_quitados) if chars_quitados else 0
-        if chars_quitados:
-            chars_enviados = len(texto_contrato) + len(texto_poliza)
-            logger.info(
-                "AHORRO POR RECORTE: -%s chars (~%s tokens) — se envían %s de %s chars (%.0f%% menos)",
-                f"{chars_quitados:,}".replace(",", "."),
-                f"{tokens_ahorrados:,}".replace(",", "."),
-                f"{chars_enviados:,}".replace(",", "."),
-                f"{chars_enviados + chars_quitados:,}".replace(",", "."),
-                100 * chars_quitados / (chars_enviados + chars_quitados),
-            )
-        else:
-            logger.info("Recorte: no se quitó nada (%s)",
-                        "desactivado por RECORTE_TOKENS=0" if not _recorte_activo()
-                        else "el documento no tenía texto prescindible")
 
         # Aviso PREVIO: estimación del tamaño antes de gastar la llamada.
         est_tokens = estimar_tokens(texto_contrato) + estimar_tokens(texto_poliza)
@@ -1974,8 +1792,9 @@ def analizar():
         else:
             datos = analizar_con_openai_compat(
                 texto_contrato, texto_poliza,
-                motor_cfg["model_id"], int(motor_cfg["max_tokens"]), prov_cfg,
-                etiqueta=modelo, uso_out=uso_tokens,
+                motor_cfg["model_id"], int(motor_cfg["max_tokens"]),
+                prov_cfg, motor_cfg["etiqueta"],
+                uso_out=uso_tokens,
             )
 
         datos = _normalizar_datos_analisis(datos, texto_poliza=texto_poliza)
@@ -2075,9 +1894,6 @@ def analizar():
                 "chars_contrato": len(texto_contrato),
                 "chars_polizas": len(texto_poliza),
                 "modelo_id": motor_cfg["model_id"],
-                # Recorte: lo que NO se envió (ni se pagó) gracias al filtrado.
-                "chars_recortados": chars_quitados,
-                "tokens_ahorrados": tokens_ahorrados,
             },
             "advertencias": advertencias,
             "num_archivos_poliza": len(polizas_leidas),
