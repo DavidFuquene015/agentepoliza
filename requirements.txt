@@ -14,3 +14,4 @@ mysql-connector-python>=8.3  # driver de MySQL
 python-dotenv>=1.0         # carga de variables desde el archivo .env
 cryptography>=42.0         # cifrado Fernet de documentos y datos sensibles
 gunicorn>=21.2             # servidor WSGI de producción (ver DEPLOY.md)
+pypdfium2>=4.30              # renderiza paginas de PDF a imagen para el analisis por vision

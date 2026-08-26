@@ -7,7 +7,6 @@ import docx                                         # extracción de texto de DO
 import json
 import os
 import io
-import base64                                      # imágenes de página en data URI para visión
 import tempfile                                     # archivos temporales (PDF/DOCX/Excel)
 from google import genai                            # SDK de Google Gemini/Gemma
 import openai as _openai_sdk                         # SDK de OpenAI (también sirve para NVIDIA NIM)
@@ -474,28 +473,16 @@ def _fusionar_amparos_claves_alias(amparos: dict) -> None:
     """Unifica sinónimos (p. ej. salario → salarios) antes de rellenar claves faltantes con 0."""
     if not isinstance(amparos, dict):
         return
-    # Se copia el bloque ENTERO, no solo valor/desde/hasta: los campos de
-    # procedencia (cita, pagina, confianza) son los que permiten auditar de dónde
-    # salió cada dato, y perderlos aquí hacía que el control los diera por ausentes.
     fusionado: dict = {}
     for k, v in list(amparos.items()):
         ck = _clave_amparo_canonica(k)
         if not isinstance(v, dict):
             v = {"valor": 0, "desde": "", "hasta": ""}
         if ck not in fusionado:
-            bloque = dict(v)
-            bloque.setdefault("valor", 0)
-            bloque.setdefault("desde", "")
-            bloque.setdefault("hasta", "")
-            fusionado[ck] = bloque
+            fusionado[ck] = {"valor": v.get("valor", 0), "desde": v.get("desde", ""), "hasta": v.get("hasta", "")}
             continue
         ex = fusionado[ck]
         va, vb = _a_numero(v.get("valor", 0), 0), _a_numero(ex.get("valor", 0), 0)
-        if va > vb:
-            # Gana el bloque nuevo: su cita es la que respalda el valor elegido.
-            for meta in ("cita", "pagina", "confianza"):
-                if v.get(meta):
-                    ex[meta] = v[meta]
         ex["valor"] = max(va, vb)
         ha, hb = _normalizar_fecha(v.get("hasta", "")), _normalizar_fecha(ex.get("hasta", ""))
         ex["hasta"] = ha if ha > hb else hb
@@ -687,10 +674,6 @@ def _coercer_amparos_entrada(amparos_raw):
         desde = item.get("desde", item.get("fecha_inicio", item.get("vigencia_desde", "")))
         hasta = item.get("hasta", item.get("fecha_fin", item.get("vigencia_hasta", "")))
         block = {"valor": val, "desde": desde, "hasta": hasta}
-        # Conserva la procedencia si el modelo la incluyó en el ítem de la lista.
-        for meta in ("cita", "pagina", "confianza"):
-            if item.get(meta):
-                block[meta] = item[meta]
         if ck in out:
             ex = out[ck]
             va, vb = _a_numero(val, 0), _a_numero(ex.get("valor", 0), 0)
@@ -1125,392 +1108,6 @@ def _extraer_json_respuesta(raw):
     return resultado
 
 
-# ══════════════════════════════════════════════════════════════
-#  LECTURA POR VISIÓN — documentos escaneados
-# ══════════════════════════════════════════════════════════════
-# Las pólizas de las aseguradoras llegan casi siempre como ESCANEO: la página
-# es una imagen y el cuadro de amparos vive dentro del píxel. La extracción de
-# texto (pdfplumber) no puede verlo, y al no verlo el modelo tendía a rellenar
-# los huecos con valores plausibles — que es como se aprobaban pólizas que no
-# cumplían.
-#
-# La solución es enviar las PÁGINAS COMO IMAGEN a un modelo con visión, que sí
-# lee el cuadro. El texto extraíble se sigue enviando como complemento: donde
-# existe es más exacto que la imagen (no hay riesgo de confundir un 3 con un 8).
-#
-# Variables de entorno:
-#   MOTORES_VISION       claves de motor que usan visión (ej. "openai,kimi")
-#   VISION_ESCALA        resolución del render (2.2 ≈ 158 ppp; por defecto 2.2)
-#   VISION_MAX_PAGINAS   tope de páginas por documento (por defecto 40)
-
-_VISION_ESCALA_DEFECTO = 2.2
-_VISION_MAX_PAG_DEFECTO = 40
-_VISION_CALIDAD_DEFECTO = 90
-
-
-# Familias de modelo con visión conocida. Sirven para que un motor recién dado
-# de alta en el panel use visión SIN tener que acordarse de añadirlo al .env:
-# olvidarlo hacía que el análisis cayera en la vía de solo texto sin avisar.
-_PATRONES_MODELO_VISION = (
-    "gpt-5", "gpt-4o", "gpt-4.1", "gpt-4-turbo", "o3", "o4",
-    "gemini", "claude", "pixtral", "llama-3.2-vision", "llama-4",
-    "qwen-vl", "qwen2-vl", "qwen2.5-vl", "internvl", "molmo",
-)
-
-
-def _motores_con_vision() -> set:
-    """Claves de motor declaradas explícitamente en MOTORES_VISION."""
-    raw = (os.environ.get("MOTORES_VISION") or "").strip()
-    return {c.strip().lower() for c in raw.split(",") if c.strip()}
-
-
-def _modelo_parece_multimodal(model_id: str) -> bool:
-    """True si el identificador del modelo pertenece a una familia con visión."""
-    m = (model_id or "").lower()
-    return any(pat in m for pat in _PATRONES_MODELO_VISION)
-
-
-def _usa_vision(clave_motor: str, prov_cfg: dict, model_id: str = "") -> bool:
-    """
-    True si este motor debe analizar por visión.
-
-    Decide en dos pasos:
-      1. Si el motor está listado en MOTORES_VISION, se respeta esa decisión.
-      2. Si no, y VISION_AUTO no está desactivado, se deduce del model_id.
-
-    Solo se aplica a proveedores de tipo openai_compatible: es la vía que admite
-    imágenes en el mismo mensaje (content con image_url). El SDK de Gemini usa
-    otra forma de adjuntar imágenes y aquí se deja fuera a propósito.
-    """
-    listado = _motores_con_vision()
-    clave = (clave_motor or "").lower()
-    explicito = clave in listado
-    auto = (os.environ.get("VISION_AUTO", "1") != "0"
-            and _modelo_parece_multimodal(model_id))
-
-    if not (explicito or auto):
-        if prov_cfg.get("tipo") == "openai_compatible":
-            logger.warning(
-                "El motor '%s' (%s) analizará SOLO TEXTO: no está en MOTORES_VISION y su "
-                "modelo no se reconoce como multimodal. Las pólizas escaneadas no se leerán.",
-                clave_motor, model_id or "sin model_id",
-            )
-        return False
-
-    if prov_cfg.get("tipo") != "openai_compatible":
-        logger.warning(
-            "El motor '%s' admitiría visión pero su proveedor es de tipo '%s'; "
-            "se analizará solo por texto.", clave_motor, prov_cfg.get("tipo"),
-        )
-        return False
-
-    logger.info("Visión activada para el motor '%s' (%s) — %s",
-                clave_motor, model_id,
-                "declarado en MOTORES_VISION" if explicito else "detectado por el modelo")
-    return True
-
-
-def _pagina_es_escaneo(pagina) -> bool:
-    """
-    True si la página es una imagen escaneada y su texto no es de fiar.
-
-    Criterio: la imagen cubre la mayor parte de la hoja, o casi no hay texto.
-    Una página de texto nativo (un contrato en Word exportado a PDF) se lee
-    mejor por texto que por imagen, así que no se renderiza.
-    """
-    try:
-        area = pagina.width * pagina.height
-        if not area:
-            return True
-        area_img = sum(im["width"] * im["height"] for im in (pagina.images or []))
-        cobertura = area_img / area
-        texto = pagina.extract_text() or ""
-        densidad = len(texto) / (area / 1000)
-        return cobertura >= 0.55 or densidad < 1.5
-    except Exception:
-        return True     # ante la duda, se envía la imagen
-
-
-def _paginas_como_imagenes(file_bytes: bytes, etiqueta: str, solo_escaneos: bool = True) -> list:
-    """
-    Renderiza páginas del PDF a JPEG. Devuelve [{'pagina': n, 'img': bytes}].
-
-    Por defecto solo renderiza las páginas ESCANEADAS: en las de texto nativo la
-    extracción es exacta y una imagen no aporta nada, solo peso. Con
-    VISION_TODAS_LAS_PAGINAS=1 se envían todas.
-
-    Se usa JPEG y no PNG porque un escaneo es una fotografía: pesa unas 3 veces
-    menos con calidad indistinguible tras el reescalado que hace el proveedor.
-
-    Si el archivo no es PDF o pypdfium2 no está disponible, devuelve lista vacía
-    y el análisis continúa solo con el texto: la visión mejora la lectura, su
-    ausencia no debe tumbar el análisis.
-    """
-    if file_bytes[:4] != b"%PDF":
-        return []
-    try:
-        import pypdfium2 as pdfium
-    except ImportError:
-        logger.warning("pypdfium2 no está instalado: %s se analizará solo por texto. "
-                       "Instálalo con  pip install pypdfium2", etiqueta)
-        return []
-
-    try:
-        escala = float(os.environ.get("VISION_ESCALA") or _VISION_ESCALA_DEFECTO)
-    except ValueError:
-        escala = _VISION_ESCALA_DEFECTO
-    try:
-        calidad = int(os.environ.get("VISION_CALIDAD_JPEG") or _VISION_CALIDAD_DEFECTO)
-    except ValueError:
-        calidad = _VISION_CALIDAD_DEFECTO
-    tope = _opcional_limite_entero_positive("VISION_MAX_PAGINAS") or _VISION_MAX_PAG_DEFECTO
-    todas = os.environ.get("VISION_TODAS_LAS_PAGINAS", "0") == "1"
-
-    # Qué páginas hace falta renderizar (pdfplumber decide; pypdfium2 dibuja).
-    a_renderizar = None
-    if not todas and solo_escaneos:
-        try:
-            with pdfplumber.open(io.BytesIO(file_bytes)) as doc:
-                a_renderizar = {i for i, pg in enumerate(doc.pages) if _pagina_es_escaneo(pg)}
-        except Exception:
-            logger.warning("No se pudo clasificar las páginas de %s; se renderizan todas", etiqueta)
-            a_renderizar = None
-
-    salida = []
-    try:
-        pdf = pdfium.PdfDocument(file_bytes)
-        total = len(pdf)
-        for i in range(min(total, tope)):
-            if a_renderizar is not None and i not in a_renderizar:
-                continue
-            buf = io.BytesIO()
-            pdf[i].render(scale=escala).to_pil().convert("RGB").save(
-                buf, format="JPEG", quality=calidad, optimize=True)
-            salida.append({"pagina": i + 1, "img": buf.getvalue()})
-        if total > tope:
-            logger.warning("%s tiene %s páginas; se envían las primeras %s (VISION_MAX_PAGINAS)",
-                           etiqueta, total, tope)
-        pdf.close()
-    except Exception:
-        logger.exception("No se pudieron renderizar las páginas de %s; se sigue solo con texto", etiqueta)
-        return []
-
-    mb = sum(len(p["img"]) for p in salida) / 1048576
-    omitidas = total - len(salida)
-    logger.info("Visión: %s -> %s de %s páginas renderizadas (%.1f MB, escala %.1f, calidad %s)%s",
-                etiqueta, len(salida), total, mb, escala, calidad,
-                f" — {omitidas} omitidas por tener texto nativo fiable" if omitidas > 0 else "")
-    return salida
-
-
-def _texto_omitiendo_paginas(file_bytes: bytes, paginas_imagen: set, etiqueta: str) -> str:
-    """
-    Texto del PDF EXCLUYENDO las páginas que ya se envían como imagen.
-
-    Cada página debe llegar al modelo en UNA sola representación. Mandar además
-    el OCR de una página escaneada es contraproducente: ese texto viene
-    corrompido ("VKjENCIAHASIA", "PLAN D£ PAGO") y obliga al modelo a conciliar
-    dos fuentes que se contradicen, gastando razonamiento y arriesgando que se
-    quede con la versión mala.
-    """
-    if not paginas_imagen:
-        return extraer_texto_pdf(file_bytes, recortar=False)
-    partes = []
-    try:
-        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-            for i, pg in enumerate(pdf.pages, 1):
-                if i in paginas_imagen:
-                    continue
-                t = pg.extract_text()
-                if t:
-                    partes.append(t)
-    except Exception:
-        logger.exception("No se pudo extraer el texto de %s; se envía solo la imagen", etiqueta)
-        return ""
-    texto = "\n".join(partes)
-    logger.info("Texto de %s: %s páginas omitidas por ir como imagen -> %s chars de texto",
-                etiqueta, len(paginas_imagen), len(texto))
-    return texto
-
-
-def _parte_imagen(img: bytes) -> dict:
-    """Envuelve un JPEG como parte de mensaje multimodal (data URI en base64)."""
-    b64 = base64.b64encode(img).decode("ascii")
-    return {"type": "image_url",
-            "image_url": {"url": "data:image/jpeg;base64," + b64, "detail": "high"}}
-
-
-# ── Prompt de VISIÓN ───────────────────────────────────────────
-# Reglas duras contra la invención de datos. El fallo observado en producción
-# no fue que el modelo leyera mal, sino que rellenaba lo que no podía leer con
-# valores plausibles (típicamente el mínimo exigido por el manual), y esos
-# valores pasaban la validación sin levantar sospecha.
-
-_SYSTEM_VISION = (
-    "Eres un perito de pólizas de seguro colombianas. Tu trabajo es LEER, no deducir. "
-    "Cada dato que reportes debe estar literalmente visible en las páginas que recibes. "
-    "Si un dato no está visible, lo declaras no encontrado. Nunca lo calculas, nunca lo "
-    "supones, nunca lo copias de otro amparo. Un dato inventado causa que se apruebe una "
-    "garantía insuficiente, que es el peor error posible en esta tarea. "
-    "Respondes ÚNICAMENTE con JSON válido, sin markdown."
-)
-
-
-def _construir_prompt_vision(texto_contrato: str, texto_poliza: str, n_pag_contrato: int,
-                             n_pag_polizas: int) -> str:
-    """Prompt del análisis por visión: exige cita textual y confianza por cada dato."""
-    return f"""Recibes un contrato y sus pólizas de seguro. Cada página llega en UNA de estas
-dos formas, y AMBAS son igual de válidas:
-
-  · COMO TEXTO  — páginas de documentos digitales. El texto es una extracción exacta del
-                  archivo original: es fiable y debes usarlo con plena confianza.
-  · COMO IMAGEN — páginas escaneadas, cuyo texto no se podía extraer. Léelas mirándolas.
-
-Que un documento venga solo como texto NO significa que falte información ni que no puedas
-verificarlo: significa que era digital y se leyó perfectamente. Rellena sus campos con
-normalidad. Solo si un dato no aparece en NINGUNA de las dos fuentes lo declaras no encontrado.
-
-Si para una misma página tuvieras texto e imagen y se contradijeran, gana la imagen.
-
-Devuelve ÚNICAMENTE este objeto JSON:
-
-{{
-  "numero_contrato": "",
-  "tipo": "servicios",
-  "contratista": "",
-  "nit_contratista": "",
-  "fecha_inicio": "YYYY-MM-DD",
-  "fecha_fin": "YYYY-MM-DD",
-  "valor_sin_iva": 0,
-  "iva": 0,
-  "valor_total": 0,
-  "requiere_liquidacion": true,
-  "aseguradora": "",
-  "num_poliza": "",
-  "aseguradora_rce": "",
-  "num_poliza_rce": "",
-  "prima_pagada": false,
-  "recibo_pago": "",
-  "firmada": false,
-  "amparos": {{
-    "cumplimiento":   {{"valor": 0, "desde": "", "hasta": "", "pagina": 0, "cita": "", "confianza": "alta|media|no_encontrado"}},
-    "salarios":       {{"valor": 0, "desde": "", "hasta": "", "pagina": 0, "cita": "", "confianza": "alta|media|no_encontrado"}},
-    "calidad":        {{"valor": 0, "desde": "", "hasta": "", "pagina": 0, "cita": "", "confianza": "alta|media|no_encontrado"}},
-    "rce":            {{"valor": 0, "desde": "", "hasta": "", "pagina": 0, "cita": "", "confianza": "alta|media|no_encontrado"}},
-    "calidad_bienes": {{"valor": 0, "desde": "", "hasta": "", "pagina": 0, "cita": "", "confianza": "alta|media|no_encontrado"}},
-    "estabilidad":    {{"valor": 0, "desde": "", "hasta": "", "pagina": 0, "cita": "", "confianza": "alta|media|no_encontrado"}}
-  }},
-  "garantias_exigidas": {{
-    "fuente": "",
-    "amparos": {{
-      "cumplimiento":   {{"pct": null, "meses_tras_terminacion": null, "cita": ""}},
-      "salarios":       {{"pct": null, "meses_tras_terminacion": null, "cita": ""}},
-      "calidad":        {{"pct": null, "meses_tras_terminacion": null, "cita": ""}},
-      "rce":            {{"pct": null, "meses_tras_terminacion": null, "cita": ""}},
-      "calidad_bienes": {{"pct": null, "meses_tras_terminacion": null, "cita": ""}},
-      "estabilidad":    {{"pct": null, "meses_tras_terminacion": null, "cita": ""}}
-    }}
-  }},
-  "observaciones_lectura": ""
-}}
-
-REGLAS INNEGOCIABLES SOBRE LOS AMPAROS
-1. Localiza en las páginas de póliza el CUADRO DE AMPAROS. Suele ser una tabla con columnas
-   del tipo: AMPARO | VIGENCIA DESDE | VIGENCIA HASTA | SUMA ASEGURADA (o VALOR ASEGURADO).
-2. Cada amparo se llena SOLO con lo que leas en su fila de esa tabla.
-3. "cita" = transcripción literal de la fila completa tal como aparece en la imagen.
-   Ejemplo: "CUMPLIMIENTO  30/01/2026  15/06/2027  $13,856,000.00"
-4. "pagina" = número de página donde está esa fila (te lo indico antes de cada imagen).
-5. Si un amparo NO aparece en ninguna tabla de amparos:
-      confianza = "no_encontrado", valor = 0, desde = "", hasta = "", cita = "", pagina = 0.
-   NO lo rellenes con el valor de otro amparo.
-   NO lo calcules como un porcentaje del contrato.
-   NO uses el "VALOR ASEGURADO TOTAL" de la carátula como si fuera el de un amparo concreto:
-   ese total es la suma de todos y no sirve para ninguno en particular.
-6. Si ves la fila pero un dato está borroso o tapado por un sello, pon confianza = "media" y
-   describe la duda en "observaciones_lectura".
-7. No confundas: el "valor asegurado" del amparo NO es la prima, ni los gastos de expedición,
-   ni el IVA, ni el total a pagar, ni un número de recibo, ni un teléfono.
-
-EQUIVALENCIAS DE NOMBRE
-- "cumplimiento"   <- CUMPLIMIENTO, CUMPLIMIENTO DEL CONTRATO
-- "salarios"       <- SALARIOS Y PRESTACIONES SOCIALES, SPPS, PAGO DE SALARIOS, RIESGOS LABORALES
-- "calidad"        <- CALIDAD DEL SERVICIO, CALIDAD
-- "rce"            <- RESPONSABILIDAD CIVIL EXTRACONTRACTUAL, RCE, PREDIOS LABORES Y OPERACIONES
-- "calidad_bienes" <- CALIDAD DE LOS BIENES, CALIDAD Y CORRECTO FUNCIONAMIENTO
-- "estabilidad"    <- ESTABILIDAD DE LA OBRA, ESTABILIDAD
-
-DATOS DEL CONTRATO
-- El contrato suele llegar COMO TEXTO (es un documento digital). Extrae de ahí el número, el
-  contratista, el NIT, las fechas y los valores. No los dejes vacíos por no tener su imagen:
-  el texto del contrato es una transcripción exacta, no un OCR aproximado.
-- fecha_inicio y fecha_fin son las del CONTRATO, no las de la póliza. Copia el día exacto que
-  diga el documento; no lo redondees a fin de mes. Ojo con erratas de composición del tipo
-  "30de junio de 2026", que significa 2026-06-30.
-- CLÁUSULA DE DOBLE PLAZO: muchos contratos fijan la duración con dos topes a la vez, del tipo
-  "hasta cuatro (4) meses y quince (15) días o hasta el 30 de junio de 2026, LO QUE PRIMERO
-  OCURRA, contados a partir del Acta de Inicio". En ese caso fecha_fin NO es la fecha fija sin
-  más: es la MENOR de las dos.
-  Para calcular la otra, suma el plazo (4 meses y 15 días) a la fecha de inicio de ejecución.
-  Si el Acta de Inicio no viene entre los documentos, usa como inicio la VIGENCIA DESDE de la
-  póliza de cumplimiento —la aseguradora la emite desde el arranque real del contrato— y dilo
-  en "observaciones_lectura".
-  Ejemplo: inicio 30/01/2026 + 4 meses y 15 días = 15/06/2026, que es ANTERIOR al 30/06/2026,
-  así que fecha_fin = 2026-06-15.
-- "tipo" solo puede ser: servicios, suministro, consultoria, obra, otros.
-- Valores numéricos sin puntos, comas ni símbolos (ej. 69280000).
-- requiere_liquidacion = true si el contrato menciona etapa o plazo de liquidación.
-
-GARANTÍAS QUE EXIGE EL PROPIO CONTRATO U ORDEN
-Casi todos los contratos y órdenes de compra traen una cláusula que dice qué garantías debe
-constituir el contratista. Suele titularse "GARANTÍAS", "Garantías requeridas", "PÓLIZAS" o ir
-numerada (p. ej. "11. GARANTÍAS"). Transcríbela en "garantias_exigidas".
-
-Por cada amparo que la cláusula mencione:
-- "pct": el porcentaje del valor del contrato que exige. Solo el número (20 para "20%").
-  Si la cláusula no da porcentaje para ese amparo, deja null.
-- "meses_tras_terminacion": CUÁNTOS MESES EN TOTAL debe seguir vigente la garantía DESPUÉS de
-  que termine el contrato. Conviértelo siempre a meses y SUMA todos los tramos que mencione:
-     "duración del contrato más cuatro (4) meses"                        ->  4
-     "duración del contrato más doce (12) meses"                         -> 12
-     "duración del contrato más tres (3) años"                           -> 36
-     "la duración, el tiempo de liquidación (6 meses) y seis (6) meses"  -> 12
-     "durante la ejecución de las actividades" (sin extensión)           ->  0
-  Si la cláusula no dice nada sobre la vigencia de ese amparo, deja null.
-- "cita": el texto literal de la cláusula para ese amparo.
-
-Deja en null lo que la cláusula NO diga: null significa "el documento calla", y entonces se
-aplicará el Manual de Contratación. No rellenes con lo que te parezca razonable.
-Si el documento no tiene cláusula de garantías, pon "fuente": "no especificadas" y deja todos
-los amparos en null.
-En "fuente" indica de dónde la sacaste: "contrato", "orden de compra" o "no especificadas".
-
-VARIAS PÓLIZAS Y SUS ANEXOS — REGLA CRÍTICA
-Una misma póliza suele llegar en varias versiones: el ANEXO 0 es la póliza original y los
-anexos siguientes (1, 2, ...) son PRÓRROGAS que AMPLÍAN o CORRIGEN las vigencias y los valores.
-
-Debes usar SIEMPRE la versión MÁS RECIENTE de cada póliza:
-- El número de anexo aparece en el nombre del archivo, que te indico antes de cada imagen
-  (por ejemplo "Anexo 0", "Anexo 1"). A mayor número, más reciente.
-- También puedes guiarte por la FECHA DE EXPEDICIÓN de la carátula y por el TIPO DE MOVIMIENTO
-  (un "ANEXO DE PRORROGA" reemplaza a lo anterior).
-- Agrupa por NÚMERO DE PÓLIZA: el anexo 1 de la póliza 65-47-101017450 sustituye al anexo 0
-  de ESA MISMA póliza, no al de otra.
-
-Si un amparo aparece con vigencias distintas en el anexo 0 y en el anexo 1, la buena es la del
-anexo 1. Tomar la del anexo 0 hace que se rechace una garantía que en realidad sí fue ampliada.
-Deja constancia en "observaciones_lectura" de qué anexo usaste para cada póliza.
-Nunca mezcles el valor de un anexo con la vigencia de otro.
-
-Páginas recibidas: contrato = {n_pag_contrato}, pólizas = {n_pag_polizas}.
-
---- CONTRATO (texto extraído del documento digital — fuente fiable) ---
-{texto_contrato}
-
---- PÓLIZAS: texto de las páginas que NO se envían como imagen ---
-{texto_poliza}"""
-
-
 # ── Prompt de análisis compartido por todos los motores de IA ──
 _SYSTEM_ANALISIS = (
     "Eres un experto jurídico en contratos colombianos y pólizas de seguro. "
@@ -1592,10 +1189,6 @@ PÓLIZAS (uno o más documentos):
 
 # Relación aproximada caracteres→tokens en español (1 token ≈ 3,6 chars).
 _CHARS_POR_TOKEN = 3.6
-
-# Coste aproximado de una página enviada como imagen con detail="high":
-# el proveedor la reescala al lado corto de 768 px y la trocea en mosaicos.
-_TOKENS_POR_IMAGEN = 1105
 
 
 def estimar_tokens(texto: str) -> int:
@@ -1757,177 +1350,6 @@ def analizar_con_openai_compat(texto_contrato, texto_poliza, model_id, max_token
     return _extraer_json_respuesta(raw)
 
 
-def analizar_con_vision(texto_contrato, texto_poliza, imgs_contrato, imgs_polizas,
-                        model_id, max_tokens, prov_cfg, etiqueta, uso_out=None):
-    """
-    Análisis multimodal: envía las páginas como imagen + el texto extraído.
-
-    imgs_contrato / imgs_polizas: listas de {'pagina': n, 'png': bytes, 'doc': nombre}.
-    Cada imagen va precedida de una línea que identifica documento y página, para
-    que el modelo pueda citar la procedencia de cada dato que reporte.
-    """
-    client = _cliente_openai_compat(prov_cfg)
-
-    contenido = [{"type": "text",
-                  "text": _construir_prompt_vision(texto_contrato, texto_poliza,
-                                                   len(imgs_contrato), len(imgs_polizas))}]
-
-    if imgs_contrato:
-        contenido.append({"type": "text", "text": "===== PÁGINAS DEL CONTRATO ====="})
-        for p in imgs_contrato:
-            contenido.append({"type": "text",
-                              "text": f"[CONTRATO — página {p['pagina']}]"})
-            contenido.append(_parte_imagen(p["img"]))
-
-    if imgs_polizas:
-        contenido.append({"type": "text", "text": "===== PÁGINAS DE LAS PÓLIZAS ====="})
-        for p in imgs_polizas:
-            contenido.append({"type": "text",
-                              "text": f"[PÓLIZA {p.get('doc','')} — página {p['pagina']}]"})
-            contenido.append(_parte_imagen(p["img"]))
-
-    # Los modelos de razonamiento (gpt-5.x) gastan parte del cupo de salida
-    # PENSANDO antes de escribir. Con 16 imágenes y un prompt largo, 4.096 tokens
-    # se agotan razonando y la respuesta llega vacía (finish_reason=length).
-    # Por eso en visión se impone un piso generoso.
-    piso = _opcional_limite_entero_positive("VISION_MIN_TOKENS_SALIDA") or 32000
-    if max_tokens < piso:
-        logger.info("Visión: tope de salida elevado de %s a %s para dejar espacio al "
-                    "razonamiento del modelo (VISION_MIN_TOKENS_SALIDA)", max_tokens, piso)
-        max_tokens = piso
-
-    n_img = len(imgs_contrato) + len(imgs_polizas)
-    kb = sum(len(p["img"]) for p in imgs_contrato + imgs_polizas) / 1024
-    logger.info("Invocando %s CON VISIÓN vía %s (%s) — %s imágenes (%.0f KB), "
-                "texto contrato=%s chars, pólizas=%s chars",
-                etiqueta, prov_cfg["clave"], model_id, n_img, kb,
-                len(texto_contrato), len(texto_poliza))
-
-    response = client.chat.completions.create(
-        model=model_id,
-        messages=[
-            {"role": "system", "content": _SYSTEM_VISION},
-            {"role": "user", "content": contenido},
-        ],
-        max_completion_tokens=max_tokens,
-        response_format={"type": "json_object"},
-    )
-
-    choice = response.choices[0]
-    raw = (choice.message.content or "").strip()
-    fr = getattr(choice, "finish_reason", None)
-
-    # Diagnóstico explícito: sin esto el fallo llegaba al usuario como un
-    # críptico "No se encontró objeto JSON válido", que no dice qué hacer.
-    if fr == "length" and not raw:
-        det = getattr(getattr(response, "usage", None), "completion_tokens_details", None)
-        razon = getattr(det, "reasoning_tokens", None) if det else None
-        logger.error(
-            "%s agotó los %s tokens de salida SIN escribir nada%s. Es un modelo de "
-            "razonamiento y el cupo se fue en pensar.",
-            etiqueta, max_tokens,
-            f" ({razon} de ellos razonando)" if razon else "",
-        )
-        raise ValueError(
-            f"El motor «{etiqueta}» se quedó sin tokens de salida antes de responder "
-            f"(tope actual: {max_tokens}). Suba el valor de «Tokens» de este motor en el "
-            f"panel Claves APIs, o defina VISION_MIN_TOKENS_SALIDA en el .env."
-        )
-    if fr == "length":
-        logger.warning(
-            "%s terminó por límite de tokens (finish_reason=length). Respuesta=%s chars. "
-            "Con visión el JSON es más largo (lleva citas): sube 'Tokens' del motor en /admin/apis.",
-            etiqueta, len(raw),
-        )
-    logger.info("%s respondió — respuesta=%s chars, finish_reason=%s", etiqueta, len(raw), fr)
-
-    uso = _uso_desde_respuesta(response, "openai_compatible")
-    _log_consumo(etiqueta + " (visión)", model_id, uso, len(texto_contrato), len(texto_poliza),
-                 max_tokens, len(texto_contrato), len(texto_poliza))
-    logger.info("   Imágenes enviadas: %s páginas (%.0f KB)", n_img, kb)
-    if uso_out is not None:
-        uso_out.update(uso)
-    return _extraer_json_respuesta(raw)
-
-
-# ── Control de procedencia ────────────────────────────────────
-# Cierra el agujero que permitía aprobar pólizas ilegibles: un amparo sin
-# respaldo visible no puede sostener una aprobación.
-
-_CONF_VALIDAS = {"alta", "media", "no_encontrado"}
-
-
-def _verificar_procedencia(datos: dict, resultados: list) -> list:
-    """
-    Revisa que cada amparo exigido tenga respaldo real y devuelve advertencias.
-
-    Marca datos['_revision_manual'] = True cuando algún amparo que participa en
-    la validación no es verificable. La ruta usa esa marca para NO emitir una
-    aprobación sobre información que el modelo no pudo leer.
-    """
-    adv = []
-    amparos = datos.get("amparos") or {}
-    if not isinstance(amparos, dict):
-        return adv
-
-    exigidos = {r["amparo"] for r in resultados}
-    etiquetas = get_amparo_labels()
-    sospechosos = 0
-
-    for clave in sorted(exigidos):
-        info = amparos.get(clave)
-        if not isinstance(info, dict):
-            continue
-        nombre = etiquetas.get(clave, AMPARO_LABELS.get(clave, clave))
-        conf = str(info.get("confianza") or "").strip().lower()
-        cita = str(info.get("cita") or "").strip()
-        valor = _a_numero(info.get("valor"), 0)
-
-        # El modelo declara explícitamente que no lo encontró.
-        if conf == "no_encontrado" or (conf == "" and cita == "" and valor == 0):
-            datos["_revision_manual"] = True
-            sospechosos += 1
-            adv.append(
-                f"🔍 «{nombre}»: el modelo NO encontró este amparo en las pólizas. "
-                "No se puede afirmar que cumpla ni que incumpla; requiere revisión manual."
-            )
-            continue
-
-        if conf == "media":
-            adv.append(
-                f"👁️ «{nombre}»: lectura de confianza MEDIA (documento borroso o dato parcialmente "
-                f"tapado). Verifique contra la póliza original. Leído: «{cita[:90]}»"
-            )
-
-        # Sin cita textual no hay forma de auditar de dónde salió el dato.
-        if valor > 0 and not cita:
-            datos["_revision_manual"] = True
-            sospechosos += 1
-            adv.append(
-                f"🔍 «{nombre}»: se reportó un valor de {_fmt_monto_col(valor)} pero el modelo no "
-                "aportó la línea de la póliza que lo respalda. Dato no auditable."
-            )
-
-    # Firma de fabricación: valor idéntico al mínimo exigido y sin cita que lo sustente.
-    for r in resultados:
-        info = amparos.get(r["amparo"])
-        if not isinstance(info, dict):
-            continue
-        vmin = r.get("valor_minimo", 0)
-        if vmin and _a_numero(info.get("valor"), 0) == vmin and not str(info.get("cita") or "").strip():
-            datos["_revision_manual"] = True
-            adv.append(
-                f"⚠️ «{r['label']}»: el valor reportado coincide EXACTAMENTE con el mínimo exigido "
-                f"({_fmt_monto_col(vmin)}) y no hay cita de la póliza. Es el patrón típico de un "
-                "dato deducido del contrato en vez de leído de la garantía. Verifíquelo."
-            )
-
-    if sospechosos:
-        logger.warning("Procedencia: %s amparo(s) sin respaldo verificable — se fuerza revisión manual",
-                       sospechosos)
-    return adv
-
-
 def add_meses(fecha_str, meses):
     """Suma N meses a una fecha YYYY-MM-DD (ajustando el día al último válido del mes). Devuelve '' si la fecha es inválida."""
     if not fecha_str:
@@ -1946,177 +1368,29 @@ def add_meses(fecha_str, meses):
         return ""
 
 
-# ══════════════════════════════════════════════════════════════
-#  REQUISITOS EXIGIBLES — prelación del documento (lex specialis)
-# ══════════════════════════════════════════════════════════════
-# El Manual de Contratación fija las garantías POR DEFECTO. Pero un contrato o
-# una orden de compra puede traer su propia cláusula de garantías, y cuando la
-# trae es ESA la que obliga: es la ley particular del negocio.
-#
-# Validar siempre contra el Manual genérico producía los dos errores:
-#   · Falsos rechazos  — se exigía más de lo pactado (p. ej. cuatro meses extra
-#                        de RCE cuando la orden solo pedía cobertura durante la
-#                        ejecución).
-#   · Falsas aprobaciones — se exigía menos (salarios al 5% cuando la orden
-#                        pedía 10%, o calidad a +4 meses cuando pedía +12).
-#
-# La prelación se aplica CAMPO A CAMPO: si el documento fija el porcentaje pero
-# calla sobre la vigencia, el porcentaje sale del documento y la vigencia del
-# Manual. Lo que el documento no diga, lo pone el Manual.
-#
-# El modelo solo transcribe la regla; el cálculo sigue siendo aritmética en
-# código, igual que antes.
-
-# Rangos admisibles: defienden de una lectura disparatada del modelo.
-_PCT_MIN, _PCT_MAX = 0, 100
-_MESES_MAX = 240        # 20 años; por encima es casi seguro un error de lectura
-
-
-def _req_documento(datos: dict) -> dict:
-    """Normaliza el bloque garantias_exigidas que el modelo extrajo del documento."""
-    ge = datos.get("garantias_exigidas")
-    if not isinstance(ge, dict):
-        return {}
-    amp = ge.get("amparos")
-    if not isinstance(amp, dict):
-        return {}
-    salida = {}
-    for clave, spec in amp.items():
-        if not isinstance(spec, dict):
-            continue
-        ck = _clave_amparo_canonica(clave)
-        pct = spec.get("pct")
-        meses = spec.get("meses_tras_terminacion")
-        limpio = {"cita": str(spec.get("cita") or "").strip()}
-
-        if pct is not None:
-            p = _a_numero(pct, None)
-            if p is None or not (_PCT_MIN <= p <= _PCT_MAX):
-                logger.warning("Garantías del documento: porcentaje inverosímil para %r (%r); "
-                               "se usará el del Manual", ck, pct)
-            else:
-                limpio["pct"] = p
-
-        if meses is not None:
-            m = _a_numero(meses, None)
-            if m is None or not (0 <= m <= _MESES_MAX):
-                logger.warning("Garantías del documento: meses inverosímiles para %r (%r); "
-                               "se usarán los del Manual", ck, meses)
-            else:
-                limpio["meses"] = int(m)
-
-        if "pct" in limpio or "meses" in limpio:
-            salida[ck] = limpio
-    return salida
-
-
-def _requisitos_efectivos(datos: dict, cfg: dict) -> tuple[dict, list]:
-    """
-    Requisitos que se van a exigir realmente, y en qué se apartan del Manual.
-
-    Devuelve ({amparo: {pct, meses, fuente_pct, fuente_meses, cita}}, advertencias).
-
-    El conjunto de amparos a verificar es la UNIÓN de los que pide el Manual para
-    el tipo de contrato y los que enumere el documento: así, si el modelo pasara
-    por alto una garantía del documento, nunca se dejaría de comprobar una que el
-    Manual sí exige.
-    """
-    doc = _req_documento(datos)
-    liq_meses = 6 if datos.get("requiere_liquidacion", True) else 0
-    etiquetas = get_amparo_labels()
-
-    exigidos = list(cfg["amparos"])
-    for ck in doc:
-        if ck not in exigidos and ck in _AMPAROS_JSON_CLAVES:
-            exigidos.append(ck)
-
-    req, adv = {}, []
-    for amparo in exigidos:
-        pct_manual = cfg["pct"].get(amparo, 0)
-        # El Manual expresa la vigencia como liquidación + ampliación; el
-        # documento la expresa como meses totales tras la terminación.
-        meses_manual = liq_meses + cfg["ext_meses"].get(amparo, 0)
-        d = doc.get(amparo, {})
-        nombre = etiquetas.get(amparo, AMPARO_LABELS.get(amparo, amparo))
-
-        pct = d.get("pct", pct_manual)
-        meses = d.get("meses", meses_manual)
-        req[amparo] = {
-            "pct": pct,
-            "meses": meses,
-            "fuente_pct": "documento" if "pct" in d else "manual",
-            "fuente_meses": "documento" if "meses" in d else "manual",
-            "cita": d.get("cita", ""),
-        }
-
-        if "pct" in d and abs(pct - pct_manual) > 0.001:
-            adv.append(
-                f"📌 «{nombre}»: se exige el {_fmt_pct(pct)} que fija el documento, no el "
-                f"{_fmt_pct(pct_manual)} del Manual." + (f" Texto: «{d['cita'][:70]}»" if d.get("cita") else "")
-            )
-        if "meses" in d and meses != meses_manual:
-            adv.append(
-                f"📌 «{nombre}»: se exige una vigencia de {meses} mes(es) tras la terminación, "
-                f"según el documento; el Manual pedía {meses_manual}."
-                + (f" Texto: «{d['cita'][:70]}»" if d.get("cita") else "")
-            )
-        if amparo not in cfg["amparos"]:
-            adv.append(
-                f"📌 «{nombre}»: lo exige el documento aunque el Manual no lo pide para este "
-                f"tipo de contrato; se verifica igualmente."
-            )
-
-    faltan_en_doc = [a for a in cfg["amparos"] if doc and a not in doc]
-    if doc and faltan_en_doc:
-        nombres = ", ".join(etiquetas.get(a, AMPARO_LABELS.get(a, a)) for a in faltan_en_doc)
-        adv.append(
-            f"ℹ️ El documento no menciona {nombres}; para esos amparos se aplican los "
-            f"requisitos del Manual de Contratación."
-        )
-    return req, adv
-
-
-def _fmt_pct(p) -> str:
-    """Porcentaje sin decimales inútiles: 20 -> '20%', 12.5 -> '12,5%'."""
-    try:
-        f = float(p)
-    except (TypeError, ValueError):
-        return f"{p}%"
-    return (f"{int(f)}%" if f == int(f) else f"{f:.1f}%".replace(".", ","))
-
-
 def validar_amparos(datos):
     """
-    Corazón de la validación: compara la póliza contra lo realmente exigible.
+    Corazón de la validación: compara la póliza contra lo exigido por el manual.
 
-    Por cada amparo calcula el valor mínimo (% del valor sin IVA) y la fecha
-    'hasta' requerida (fecha de terminación + meses de vigencia posterior), y los
-    compara con lo que trae la póliza. Los requisitos salen del propio contrato u
-    orden cuando este los fija, y del Manual de Contratación cuando calla
-    (ver _requisitos_efectivos). El cálculo es aritmética pura: la IA no decide.
-
-    Devuelve una lista con ok_valor / ok_hasta / ok (CUMPLE o NO CUMPLE) por amparo.
+    Para el tipo de contrato, calcula por cada amparo el valor mínimo (% del valor
+    sin IVA) y la fecha 'hasta' requerida (fecha fin + meses de liquidación +
+    ampliación del amparo), y los compara con lo que trae la póliza. Devuelve una
+    lista de resultados con ok_valor / ok_hasta / ok (CUMPLE o NO CUMPLE) por amparo.
     """
     tipo = datos.get("tipo", "otros")
     tc = get_tipos_contrato()
     cfg = tc.get(tipo, tc.get("otros", TIPOS_CONTRATO["otros"]))
     valor_base = datos.get("valor_sin_iva", 0)
     fecha_fin = datos.get("fecha_fin", "")
-
-    # Requisitos realmente exigibles: manda el documento donde se pronuncie,
-    # el Manual donde calle. Las advertencias quedan colgadas de `datos` para
-    # que la ruta las muestre sin cambiar la firma de esta función.
-    req, adv_req = _requisitos_efectivos(datos, cfg)
-    if adv_req:
-        datos["_advertencias_requisitos"] = adv_req
+    liq_meses = 6 if datos.get("requiere_liquidacion", True) else 0
 
     resultados = []
     al = get_amparo_labels()
-    for amparo, r in req.items():
-        pct = r["pct"]
+    for amparo in cfg["amparos"]:
+        pct = cfg["pct"].get(amparo, 0)
+        ext = cfg["ext_meses"].get(amparo, 0)
         valor_min = round(valor_base * pct / 100)
-        # meses = total tras la terminación del contrato (liquidación incluida).
-        hasta_req = add_meses(fecha_fin, r["meses"])
+        hasta_req = add_meses(add_meses(fecha_fin, liq_meses), ext)
 
         info_poliza = datos.get("amparos", {}).get(amparo, {})
         valor_poliza = info_poliza.get("valor", 0)
@@ -2144,12 +1418,7 @@ def validar_amparos(datos):
             "desde_poliza": desde_poliza,
             "ok_valor": ok_valor,
             "ok_hasta": ok_hasta,
-            "ok": ok,
-            # Trazabilidad: de dónde salió cada requisito aplicado.
-            "meses_requeridos": r["meses"],
-            "fuente_pct": r["fuente_pct"],
-            "fuente_meses": r["fuente_meses"],
-            "cita_requisito": r["cita"],
+            "ok": ok
         })
 
     return resultados
@@ -2642,60 +1911,11 @@ def analizar():
                 return extraer_texto_docx(contenido)
             return contenido.decode("utf-8", errors="ignore")
 
-        # ¿Este motor analiza por visión? Se decide ANTES de extraer, porque con
-        # visión el texto se envía completo (sin recorte): la imagen es la fuente
-        # de verdad y el texto sirve de contraste, así que mutilarlo resta.
-        vision = _usa_vision(modelo, prov_cfg, motor_cfg.get("model_id", ""))
-
-        def extraer_v(contenido, nombre):
-            """Extracción de texto; sin recorte cuando el análisis es por visión."""
-            n = (nombre or "").lower()
-            if n.endswith(".pdf"):
-                return extraer_texto_pdf(
-                    contenido, recortar=not vision, etiqueta=nombre or "PDF",
-                    info_out=recorte_info,
-                )
-            elif n.endswith(".docx"):
-                return extraer_texto_docx(contenido)
-            return contenido.decode("utf-8", errors="ignore")
-
-        imgs_contrato, imgs_polizas = [], []
-
-        if not vision:
-            texto_contrato = extraer_v(bytes_contrato, archivo_contrato.filename)
-            texto_poliza = _construir_texto_polizas(
-                polizas_leidas, extraer_v,
-                max_chars=_opcional_limite_entero_positive("MAX_CHARS_POLIZAS_IA"),
-            )
-        else:
-            # Con visión: cada página llega en UNA sola representación —
-            # imagen si es escaneo, texto si es nativa. Nunca las dos.
-            nom_c = archivo_contrato.filename or "contrato"
-            imgs_contrato = _paginas_como_imagenes(bytes_contrato, nom_c)
-            texto_contrato = _texto_omitiendo_paginas(
-                bytes_contrato, {p["pagina"] for p in imgs_contrato}, nom_c)
-
-            bloques_pol = []
-            for i, (contenido_pol, nombre_pol) in enumerate(polizas_leidas, 1):
-                pags = _paginas_como_imagenes(contenido_pol, nombre_pol)
-                for pag in pags:
-                    pag["doc"] = nombre_pol
-                    imgs_polizas.append(pag)
-                t = _texto_omitiendo_paginas(
-                    contenido_pol, {p["pagina"] for p in pags}, nombre_pol)
-                cabecera = f"===== DOCUMENTO DE PÓLIZA {i} DE {len(polizas_leidas)} — {nombre_pol} ====="
-                if t.strip():
-                    bloques_pol.append(f"{cabecera}\n{t}")
-                else:
-                    bloques_pol.append(
-                        f"{cabecera}\n(Este documento se envía COMPLETO como imagen; "
-                        f"no hay texto extraíble fiable. Léelo de las páginas adjuntas.)")
-            texto_poliza = "\n\n".join(bloques_pol)
-
-            if not imgs_polizas and not imgs_contrato:
-                logger.warning("Visión activada pero no se pudo renderizar ninguna página; "
-                               "el análisis continúa solo con texto")
-                vision = False
+        texto_contrato = extraer(bytes_contrato, archivo_contrato.filename)
+        max_chars_pol_ia = _opcional_limite_entero_positive("MAX_CHARS_POLIZAS_IA")
+        texto_poliza = _construir_texto_polizas(
+            polizas_leidas, extraer, max_chars=max_chars_pol_ia
+        )
         logger.info(
             "Texto extraído (contrato=%s chars, pólizas combinadas=%s chars, archivos=%s)",
             len(texto_contrato),
@@ -2703,19 +1923,10 @@ def analizar():
             len(polizas_leidas),
         )
 
-        # Sin visión, un documento sin texto no se puede analizar. CON visión sí:
-        # el escaneo es precisamente el caso que la visión viene a resolver, así
-        # que solo se exige que haya páginas renderizadas.
-        if not vision:
-            if len(texto_contrato) < 50:
-                return jsonify({"error": "No se pudo extraer texto del contrato. Verifica que el PDF no sea imagen escaneada."}), 400
-            if len(texto_poliza) < 50:
-                return jsonify({"error": "No se pudo extraer texto de la póliza. Verifica que el PDF no sea imagen escaneada."}), 400
-        else:
-            if not imgs_contrato and len(texto_contrato) < 50:
-                return jsonify({"error": "No se pudo leer el contrato: ni texto ni páginas renderizables."}), 400
-            if not imgs_polizas and len(texto_poliza) < 50:
-                return jsonify({"error": "No se pudo leer la póliza: ni texto ni páginas renderizables."}), 400
+        if len(texto_contrato) < 50:
+            return jsonify({"error": "No se pudo extraer texto del contrato. Verifica que el PDF no sea imagen escaneada."}), 400
+        if len(texto_poliza) < 50:
+            return jsonify({"error": "No se pudo extraer texto de la póliza. Verifica que el PDF no sea imagen escaneada."}), 400
 
         # Informe del recorte: cuánto se dejó de enviar (y por tanto de pagar).
         chars_quitados = recorte_info.get("chars_quitados", 0)
@@ -2736,19 +1947,12 @@ def analizar():
                         else "el documento no tenía texto prescindible")
 
         # Aviso PREVIO: estimación del tamaño antes de gastar la llamada.
-        # Una página como imagen cuesta del orden de 1.100 tokens con detail=high;
-        # sin contarlas, la estimación se quedaba a un tercio del consumo real.
         est_tokens = estimar_tokens(texto_contrato) + estimar_tokens(texto_poliza)
-        n_imgs = len(imgs_contrato) + len(imgs_polizas)
-        if n_imgs:
-            est_tokens += n_imgs * _TOKENS_POR_IMAGEN
-            logger.info("Estimación incluye %s páginas como imagen (~%s tokens)",
-                        n_imgs, f"{n_imgs * _TOKENS_POR_IMAGEN:,}".replace(",", "."))
         logger.info(
             "Estimación previa de entrada: ~%s tokens (contrato+pólizas)",
             f"{est_tokens:,}".replace(",", "."),
         )
-        if est_tokens > 16000 and not vision:
+        if est_tokens > 16000:
             logger.warning(
                 "El envío estimado (~%s tokens) supera 16.000: puede fallar en Gemini gratuito "
                 "y tardar mucho en modelos de razonamiento. Ajusta MAX_CHARS_PROMPT_* si falla.",
@@ -2761,13 +1965,7 @@ def analizar():
 
         # Despacho por TIPO de proveedor: 'gemini' usa su SDK propio; cualquier
         # otro proveedor se atiende por la API compatible con OpenAI.
-        if vision:
-            datos = analizar_con_vision(
-                texto_contrato, texto_poliza, imgs_contrato, imgs_polizas,
-                motor_cfg["model_id"], int(motor_cfg["max_tokens"]), prov_cfg,
-                etiqueta=modelo, uso_out=uso_tokens,
-            )
-        elif prov_cfg["tipo"] == "gemini":
+        if prov_cfg["tipo"] == "gemini":
             datos = analizar_con_gemini(
                 texto_contrato, texto_poliza,
                 motor_cfg["model_id"], int(motor_cfg["max_tokens"]), prov_cfg,
@@ -2780,10 +1978,7 @@ def analizar():
                 etiqueta=modelo, uso_out=uso_tokens,
             )
 
-        # Con visión NO se aplica el rescate de salarios por texto: esa heurística
-        # existía para paliar la ceguera ante los escaneos y es una fuente conocida
-        # de falsos positivos (llegó a tomar un teléfono como suma asegurada).
-        datos = _normalizar_datos_analisis(datos, texto_poliza=None if vision else texto_poliza)
+        datos = _normalizar_datos_analisis(datos, texto_poliza=texto_poliza)
         amp_ia_warn = datos.pop("_advertencias_amparos_ia", None) or []
         ia_ff = datos.get("fecha_fin", "")
         ff_regex = _extraer_fecha_terminacion_desde_texto_contrato(texto_contrato, ia_fin=ia_ff)
@@ -2798,11 +1993,6 @@ def analizar():
         logger.info("Respuesta de %s parseada correctamente", modelo)
 
         resultados = validar_amparos(datos)
-
-        # Procedencia: ningún amparo sin respaldo puede sostener una aprobación.
-        adv_procedencia = _verificar_procedencia(datos, resultados) if vision else []
-        revision_manual = bool(datos.pop("_revision_manual", False))
-
         explic_ia = generar_explicaciones_no_cumple_ia(resultados, modelo)
         for r in resultados:
             if r["ok"]:
@@ -2814,19 +2004,6 @@ def analizar():
 
         todos_ok = all(r["ok"] for r in resultados)
         cumplidos = sum(1 for r in resultados if r["ok"])
-
-        # ── Ningún amparo ilegible puede sostener una aprobación ──
-        # Si el modelo no pudo leer un amparo, no sabemos si cumple. Aprobar en
-        # esa situación es exactamente el fallo que se detectó en producción, así
-        # que el veredicto se degrada a OBSERVADA y se dice por qué. Se conserva
-        # el vocabulario APROBADA/OBSERVADA para no romper histórico, Excel ni UI.
-        if todos_ok and revision_manual:
-            todos_ok = False
-            logger.warning(
-                "Veredicto degradado a OBSERVADA: los amparos cumplirían, pero hay datos "
-                "sin respaldo verificable en la póliza."
-            )
-
         logger.info(
             "Validación de amparos completada — %s/%s cumplen — resultado: %s",
             cumplidos, len(resultados),
@@ -2836,24 +2013,6 @@ def analizar():
         resultado_str = "APROBADA" if todos_ok else "OBSERVADA"
 
         advertencias = []
-        # Prelación del documento: se dice explícitamente en qué se apartó del Manual.
-        adv_requisitos = datos.pop("_advertencias_requisitos", None) or []
-        if adv_requisitos:
-            fuente = ((datos.get("garantias_exigidas") or {}).get("fuente") or "").strip()
-            advertencias.append(
-                "⚖️ Se validó contra la cláusula de garantías del propio "
-                f"{fuente or 'documento'}, que prevalece sobre el Manual de Contratación."
-            )
-            advertencias.extend(adv_requisitos)
-        if revision_manual:
-            advertencias.append(
-                "🛑 REQUIERE REVISIÓN MANUAL. Uno o más amparos no se pudieron leer con respaldo "
-                "en la póliza, así que el sistema NO puede afirmar que la garantía cumpla. "
-                "El resultado se marcó OBSERVADA por precaución: revise los puntos señalados "
-                "contra el documento original antes de decidir."
-            )
-        if adv_procedencia:
-            advertencias.extend(adv_procedencia)
         if amp_ia_warn:
             advertencias.extend(amp_ia_warn)
         if datos.get("valor_sin_iva", 0) == 0:
@@ -2919,11 +2078,7 @@ def analizar():
                 # Recorte: lo que NO se envió (ni se pagó) gracias al filtrado.
                 "chars_recortados": chars_quitados,
                 "tokens_ahorrados": tokens_ahorrados,
-                # Visión: páginas enviadas como imagen.
-                "vision": vision,
-                "paginas_imagen": len(imgs_contrato) + len(imgs_polizas),
             },
-            "revision_manual": revision_manual,
             "advertencias": advertencias,
             "num_archivos_poliza": len(polizas_leidas),
         })
@@ -2987,13 +2142,6 @@ def recalcular():
 
         resultados = validar_amparos(datos)
         modelo = row.get("modelo") or "gemini"
-
-        # El mismo control de procedencia que en /api/analizar. Sin esto, corregir
-        # una fecha podía convertir en APROBADA un análisis cuyos amparos nunca se
-        # pudieron leer: la corrección arregla la fecha, no la falta de respaldo.
-        adv_procedencia = _verificar_procedencia(datos, resultados)
-        revision_manual = bool(datos.pop("_revision_manual", False))
-
         explic_ia = generar_explicaciones_no_cumple_ia(resultados, modelo)
         for r in resultados:
             if r["ok"]:
@@ -3004,10 +2152,6 @@ def recalcular():
                 )
 
         todos_ok = all(r["ok"] for r in resultados)
-        if todos_ok and revision_manual:
-            todos_ok = False
-            logger.warning("Recálculo doc_id=%s: veredicto degradado a OBSERVADA por falta de "
-                           "respaldo verificable en los amparos", doc_id)
         resultado_str = "APROBADA" if todos_ok else "OBSERVADA"
 
         database.actualizar_documento_datos(doc_id, datos, resultado_str)
@@ -3015,25 +2159,9 @@ def recalcular():
         excel_path = generar_excel(datos, resultados)
         app.config["LAST_EXCEL"] = excel_path
 
-        advertencias = ["ℹ️ Resultado recalculado con las fechas corregidas manualmente."]
-        adv_requisitos = datos.pop("_advertencias_requisitos", None) or []
-        if adv_requisitos:
-            fuente = ((datos.get("garantias_exigidas") or {}).get("fuente") or "").strip()
-            advertencias.append(
-                "⚖️ Se validó contra la cláusula de garantías del propio "
-                f"{fuente or 'documento'}, que prevalece sobre el Manual de Contratación."
-            )
-            advertencias.extend(adv_requisitos)
-        if revision_manual:
-            advertencias.append(
-                "🛑 REQUIERE REVISIÓN MANUAL. Corregir la fecha no resuelve que uno o más amparos "
-                "no tengan respaldo legible en la póliza; el resultado sigue marcado OBSERVADA."
-            )
-        advertencias.extend(adv_procedencia)
-
         logger.info(
-            "Recálculo doc_id=%s — fecha_inicio=%s fecha_fin=%s → %s",
-            doc_id, fecha_inicio or "(sin cambio)", fecha_fin or "(sin cambio)", resultado_str,
+            "Recálculo doc_id=%s — fecha_fin=%s → %s",
+            doc_id, fecha_fin, resultado_str,
         )
         return jsonify({
             "datos": datos,
@@ -3042,9 +2170,8 @@ def recalcular():
             "excel_listo": True,
             "modelo_usado": modelo,
             "doc_id": doc_id,
-            "revision_manual": revision_manual,
-            "advertencias": advertencias,
-            "num_archivos_poliza": int(row.get("num_polizas") or 1),
+            "advertencias": ["ℹ️ Resultado recalculado con fechas corregidas manualmente."],
+            "num_archivos_poliza": 1,
         })
     except Exception as e:
         logger.exception("Error en /api/recalcular")

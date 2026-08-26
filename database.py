@@ -620,8 +620,8 @@ def get_documento_json(doc_id: int):
     try:
         cur = conn.cursor(dictionary=True)
         cur.execute(
-            "SELECT datos_json, archivo_contrato, archivo_poliza, modelo, resultado "
-            "FROM documentos WHERE id = %s",
+            "SELECT datos_json, archivo_contrato, archivo_poliza, modelo, resultado, "
+            "num_polizas FROM documentos WHERE id = %s",
             (doc_id,),
         )
         row = cur.fetchone()

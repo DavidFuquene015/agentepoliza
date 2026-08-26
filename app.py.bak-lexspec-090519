@@ -1400,17 +1400,6 @@ Devuelve ÚNICAMENTE este objeto JSON:
     "calidad_bienes": {{"valor": 0, "desde": "", "hasta": "", "pagina": 0, "cita": "", "confianza": "alta|media|no_encontrado"}},
     "estabilidad":    {{"valor": 0, "desde": "", "hasta": "", "pagina": 0, "cita": "", "confianza": "alta|media|no_encontrado"}}
   }},
-  "garantias_exigidas": {{
-    "fuente": "",
-    "amparos": {{
-      "cumplimiento":   {{"pct": null, "meses_tras_terminacion": null, "cita": ""}},
-      "salarios":       {{"pct": null, "meses_tras_terminacion": null, "cita": ""}},
-      "calidad":        {{"pct": null, "meses_tras_terminacion": null, "cita": ""}},
-      "rce":            {{"pct": null, "meses_tras_terminacion": null, "cita": ""}},
-      "calidad_bienes": {{"pct": null, "meses_tras_terminacion": null, "cita": ""}},
-      "estabilidad":    {{"pct": null, "meses_tras_terminacion": null, "cita": ""}}
-    }}
-  }},
   "observaciones_lectura": ""
 }}
 
@@ -1460,30 +1449,6 @@ DATOS DEL CONTRATO
 - "tipo" solo puede ser: servicios, suministro, consultoria, obra, otros.
 - Valores numéricos sin puntos, comas ni símbolos (ej. 69280000).
 - requiere_liquidacion = true si el contrato menciona etapa o plazo de liquidación.
-
-GARANTÍAS QUE EXIGE EL PROPIO CONTRATO U ORDEN
-Casi todos los contratos y órdenes de compra traen una cláusula que dice qué garantías debe
-constituir el contratista. Suele titularse "GARANTÍAS", "Garantías requeridas", "PÓLIZAS" o ir
-numerada (p. ej. "11. GARANTÍAS"). Transcríbela en "garantias_exigidas".
-
-Por cada amparo que la cláusula mencione:
-- "pct": el porcentaje del valor del contrato que exige. Solo el número (20 para "20%").
-  Si la cláusula no da porcentaje para ese amparo, deja null.
-- "meses_tras_terminacion": CUÁNTOS MESES EN TOTAL debe seguir vigente la garantía DESPUÉS de
-  que termine el contrato. Conviértelo siempre a meses y SUMA todos los tramos que mencione:
-     "duración del contrato más cuatro (4) meses"                        ->  4
-     "duración del contrato más doce (12) meses"                         -> 12
-     "duración del contrato más tres (3) años"                           -> 36
-     "la duración, el tiempo de liquidación (6 meses) y seis (6) meses"  -> 12
-     "durante la ejecución de las actividades" (sin extensión)           ->  0
-  Si la cláusula no dice nada sobre la vigencia de ese amparo, deja null.
-- "cita": el texto literal de la cláusula para ese amparo.
-
-Deja en null lo que la cláusula NO diga: null significa "el documento calla", y entonces se
-aplicará el Manual de Contratación. No rellenes con lo que te parezca razonable.
-Si el documento no tiene cláusula de garantías, pon "fuente": "no especificadas" y deja todos
-los amparos en null.
-En "fuente" indica de dónde la sacaste: "contrato", "orden de compra" o "no especificadas".
 
 VARIAS PÓLIZAS Y SUS ANEXOS — REGLA CRÍTICA
 Una misma póliza suele llegar en varias versiones: el ANEXO 0 es la póliza original y los
@@ -1946,177 +1911,29 @@ def add_meses(fecha_str, meses):
         return ""
 
 
-# ══════════════════════════════════════════════════════════════
-#  REQUISITOS EXIGIBLES — prelación del documento (lex specialis)
-# ══════════════════════════════════════════════════════════════
-# El Manual de Contratación fija las garantías POR DEFECTO. Pero un contrato o
-# una orden de compra puede traer su propia cláusula de garantías, y cuando la
-# trae es ESA la que obliga: es la ley particular del negocio.
-#
-# Validar siempre contra el Manual genérico producía los dos errores:
-#   · Falsos rechazos  — se exigía más de lo pactado (p. ej. cuatro meses extra
-#                        de RCE cuando la orden solo pedía cobertura durante la
-#                        ejecución).
-#   · Falsas aprobaciones — se exigía menos (salarios al 5% cuando la orden
-#                        pedía 10%, o calidad a +4 meses cuando pedía +12).
-#
-# La prelación se aplica CAMPO A CAMPO: si el documento fija el porcentaje pero
-# calla sobre la vigencia, el porcentaje sale del documento y la vigencia del
-# Manual. Lo que el documento no diga, lo pone el Manual.
-#
-# El modelo solo transcribe la regla; el cálculo sigue siendo aritmética en
-# código, igual que antes.
-
-# Rangos admisibles: defienden de una lectura disparatada del modelo.
-_PCT_MIN, _PCT_MAX = 0, 100
-_MESES_MAX = 240        # 20 años; por encima es casi seguro un error de lectura
-
-
-def _req_documento(datos: dict) -> dict:
-    """Normaliza el bloque garantias_exigidas que el modelo extrajo del documento."""
-    ge = datos.get("garantias_exigidas")
-    if not isinstance(ge, dict):
-        return {}
-    amp = ge.get("amparos")
-    if not isinstance(amp, dict):
-        return {}
-    salida = {}
-    for clave, spec in amp.items():
-        if not isinstance(spec, dict):
-            continue
-        ck = _clave_amparo_canonica(clave)
-        pct = spec.get("pct")
-        meses = spec.get("meses_tras_terminacion")
-        limpio = {"cita": str(spec.get("cita") or "").strip()}
-
-        if pct is not None:
-            p = _a_numero(pct, None)
-            if p is None or not (_PCT_MIN <= p <= _PCT_MAX):
-                logger.warning("Garantías del documento: porcentaje inverosímil para %r (%r); "
-                               "se usará el del Manual", ck, pct)
-            else:
-                limpio["pct"] = p
-
-        if meses is not None:
-            m = _a_numero(meses, None)
-            if m is None or not (0 <= m <= _MESES_MAX):
-                logger.warning("Garantías del documento: meses inverosímiles para %r (%r); "
-                               "se usarán los del Manual", ck, meses)
-            else:
-                limpio["meses"] = int(m)
-
-        if "pct" in limpio or "meses" in limpio:
-            salida[ck] = limpio
-    return salida
-
-
-def _requisitos_efectivos(datos: dict, cfg: dict) -> tuple[dict, list]:
-    """
-    Requisitos que se van a exigir realmente, y en qué se apartan del Manual.
-
-    Devuelve ({amparo: {pct, meses, fuente_pct, fuente_meses, cita}}, advertencias).
-
-    El conjunto de amparos a verificar es la UNIÓN de los que pide el Manual para
-    el tipo de contrato y los que enumere el documento: así, si el modelo pasara
-    por alto una garantía del documento, nunca se dejaría de comprobar una que el
-    Manual sí exige.
-    """
-    doc = _req_documento(datos)
-    liq_meses = 6 if datos.get("requiere_liquidacion", True) else 0
-    etiquetas = get_amparo_labels()
-
-    exigidos = list(cfg["amparos"])
-    for ck in doc:
-        if ck not in exigidos and ck in _AMPAROS_JSON_CLAVES:
-            exigidos.append(ck)
-
-    req, adv = {}, []
-    for amparo in exigidos:
-        pct_manual = cfg["pct"].get(amparo, 0)
-        # El Manual expresa la vigencia como liquidación + ampliación; el
-        # documento la expresa como meses totales tras la terminación.
-        meses_manual = liq_meses + cfg["ext_meses"].get(amparo, 0)
-        d = doc.get(amparo, {})
-        nombre = etiquetas.get(amparo, AMPARO_LABELS.get(amparo, amparo))
-
-        pct = d.get("pct", pct_manual)
-        meses = d.get("meses", meses_manual)
-        req[amparo] = {
-            "pct": pct,
-            "meses": meses,
-            "fuente_pct": "documento" if "pct" in d else "manual",
-            "fuente_meses": "documento" if "meses" in d else "manual",
-            "cita": d.get("cita", ""),
-        }
-
-        if "pct" in d and abs(pct - pct_manual) > 0.001:
-            adv.append(
-                f"📌 «{nombre}»: se exige el {_fmt_pct(pct)} que fija el documento, no el "
-                f"{_fmt_pct(pct_manual)} del Manual." + (f" Texto: «{d['cita'][:70]}»" if d.get("cita") else "")
-            )
-        if "meses" in d and meses != meses_manual:
-            adv.append(
-                f"📌 «{nombre}»: se exige una vigencia de {meses} mes(es) tras la terminación, "
-                f"según el documento; el Manual pedía {meses_manual}."
-                + (f" Texto: «{d['cita'][:70]}»" if d.get("cita") else "")
-            )
-        if amparo not in cfg["amparos"]:
-            adv.append(
-                f"📌 «{nombre}»: lo exige el documento aunque el Manual no lo pide para este "
-                f"tipo de contrato; se verifica igualmente."
-            )
-
-    faltan_en_doc = [a for a in cfg["amparos"] if doc and a not in doc]
-    if doc and faltan_en_doc:
-        nombres = ", ".join(etiquetas.get(a, AMPARO_LABELS.get(a, a)) for a in faltan_en_doc)
-        adv.append(
-            f"ℹ️ El documento no menciona {nombres}; para esos amparos se aplican los "
-            f"requisitos del Manual de Contratación."
-        )
-    return req, adv
-
-
-def _fmt_pct(p) -> str:
-    """Porcentaje sin decimales inútiles: 20 -> '20%', 12.5 -> '12,5%'."""
-    try:
-        f = float(p)
-    except (TypeError, ValueError):
-        return f"{p}%"
-    return (f"{int(f)}%" if f == int(f) else f"{f:.1f}%".replace(".", ","))
-
-
 def validar_amparos(datos):
     """
-    Corazón de la validación: compara la póliza contra lo realmente exigible.
+    Corazón de la validación: compara la póliza contra lo exigido por el manual.
 
-    Por cada amparo calcula el valor mínimo (% del valor sin IVA) y la fecha
-    'hasta' requerida (fecha de terminación + meses de vigencia posterior), y los
-    compara con lo que trae la póliza. Los requisitos salen del propio contrato u
-    orden cuando este los fija, y del Manual de Contratación cuando calla
-    (ver _requisitos_efectivos). El cálculo es aritmética pura: la IA no decide.
-
-    Devuelve una lista con ok_valor / ok_hasta / ok (CUMPLE o NO CUMPLE) por amparo.
+    Para el tipo de contrato, calcula por cada amparo el valor mínimo (% del valor
+    sin IVA) y la fecha 'hasta' requerida (fecha fin + meses de liquidación +
+    ampliación del amparo), y los compara con lo que trae la póliza. Devuelve una
+    lista de resultados con ok_valor / ok_hasta / ok (CUMPLE o NO CUMPLE) por amparo.
     """
     tipo = datos.get("tipo", "otros")
     tc = get_tipos_contrato()
     cfg = tc.get(tipo, tc.get("otros", TIPOS_CONTRATO["otros"]))
     valor_base = datos.get("valor_sin_iva", 0)
     fecha_fin = datos.get("fecha_fin", "")
-
-    # Requisitos realmente exigibles: manda el documento donde se pronuncie,
-    # el Manual donde calle. Las advertencias quedan colgadas de `datos` para
-    # que la ruta las muestre sin cambiar la firma de esta función.
-    req, adv_req = _requisitos_efectivos(datos, cfg)
-    if adv_req:
-        datos["_advertencias_requisitos"] = adv_req
+    liq_meses = 6 if datos.get("requiere_liquidacion", True) else 0
 
     resultados = []
     al = get_amparo_labels()
-    for amparo, r in req.items():
-        pct = r["pct"]
+    for amparo in cfg["amparos"]:
+        pct = cfg["pct"].get(amparo, 0)
+        ext = cfg["ext_meses"].get(amparo, 0)
         valor_min = round(valor_base * pct / 100)
-        # meses = total tras la terminación del contrato (liquidación incluida).
-        hasta_req = add_meses(fecha_fin, r["meses"])
+        hasta_req = add_meses(add_meses(fecha_fin, liq_meses), ext)
 
         info_poliza = datos.get("amparos", {}).get(amparo, {})
         valor_poliza = info_poliza.get("valor", 0)
@@ -2144,12 +1961,7 @@ def validar_amparos(datos):
             "desde_poliza": desde_poliza,
             "ok_valor": ok_valor,
             "ok_hasta": ok_hasta,
-            "ok": ok,
-            # Trazabilidad: de dónde salió cada requisito aplicado.
-            "meses_requeridos": r["meses"],
-            "fuente_pct": r["fuente_pct"],
-            "fuente_meses": r["fuente_meses"],
-            "cita_requisito": r["cita"],
+            "ok": ok
         })
 
     return resultados
@@ -2836,15 +2648,6 @@ def analizar():
         resultado_str = "APROBADA" if todos_ok else "OBSERVADA"
 
         advertencias = []
-        # Prelación del documento: se dice explícitamente en qué se apartó del Manual.
-        adv_requisitos = datos.pop("_advertencias_requisitos", None) or []
-        if adv_requisitos:
-            fuente = ((datos.get("garantias_exigidas") or {}).get("fuente") or "").strip()
-            advertencias.append(
-                "⚖️ Se validó contra la cláusula de garantías del propio "
-                f"{fuente or 'documento'}, que prevalece sobre el Manual de Contratación."
-            )
-            advertencias.extend(adv_requisitos)
         if revision_manual:
             advertencias.append(
                 "🛑 REQUIERE REVISIÓN MANUAL. Uno o más amparos no se pudieron leer con respaldo "
@@ -3016,14 +2819,6 @@ def recalcular():
         app.config["LAST_EXCEL"] = excel_path
 
         advertencias = ["ℹ️ Resultado recalculado con las fechas corregidas manualmente."]
-        adv_requisitos = datos.pop("_advertencias_requisitos", None) or []
-        if adv_requisitos:
-            fuente = ((datos.get("garantias_exigidas") or {}).get("fuente") or "").strip()
-            advertencias.append(
-                "⚖️ Se validó contra la cláusula de garantías del propio "
-                f"{fuente or 'documento'}, que prevalece sobre el Manual de Contratación."
-            )
-            advertencias.extend(adv_requisitos)
         if revision_manual:
             advertencias.append(
                 "🛑 REQUIERE REVISIÓN MANUAL. Corregir la fecha no resuelve que uno o más amparos "
