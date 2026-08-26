@@ -1,0 +1,18 @@
+# Secretos: NUNCA al repositorio
+.env
+*.env
+!.env.example
+
+# Cache de Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Documentos historicos cifrados (contratos y polizas reales)
+var/
+
+# Respaldos locales y temporales
+*.bak-*
+*.tmp
+*.xlsx
+output.txt
