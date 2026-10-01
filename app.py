@@ -520,7 +520,14 @@ def _a_numero(valor, default=0):
             return default
         limpio = re.sub(r"[^0-9,.\-]", "", limpio)
         if "," in limpio and "." in limpio:
-            limpio = limpio.replace(".", "").replace(",", ".")
+            if limpio.rfind(",") > limpio.rfind("."):     # 1.234.567,89
+                limpio = limpio.replace(".", "").replace(",", ".")
+            else:                                          # 1,234,567.89
+                limpio = limpio.replace(",", "")
+        elif limpio.count(".") > 1 or limpio.count(",") > 1:
+            # Separador repetido = separador de miles ("3.464.000"); antes
+            # float() fallaba y el monto quedaba en el valor por defecto.
+            limpio = limpio.replace(".", "").replace(",", "")
         elif "," in limpio and "." not in limpio:
             limpio = limpio.replace(",", ".")
         try:
@@ -1340,6 +1347,138 @@ def _parte_imagen(img: bytes) -> dict:
             "image_url": {"url": "data:image/jpeg;base64," + b64, "detail": "high"}}
 
 
+# ── Instrucciones del revisor en el prompt ─────────────────────
+# Se añaden SOLO cuando el revisor escribió algo: sin instrucciones, el prompt
+# es exactamente el de siempre y el comportamiento no cambia.
+
+_PLANTILLA_INSTRUCCIONES = """
+═══════════ INSTRUCCIONES DEL REVISOR — MÁXIMA PRIORIDAD ═══════════
+El funcionario que revisa esta póliza escribió las siguientes instrucciones. Tienen prioridad
+sobre el Manual de Contratación, sobre la cláusula de garantías del propio contrato u orden y
+sobre lo que se lea en el contrato y en las pólizas.
+
+--- INICIO DE LAS INSTRUCCIONES ---
+@@TEXTO@@
+--- FIN DE LAS INSTRUCCIONES ---
+
+Tradúcelas al bloque "instrucciones_aplicadas", que debes AÑADIR al JSON de respuesta:
+
+"instrucciones_aplicadas": {
+  "contrato": {"fecha_inicio": null, "fecha_fin": null, "valor_sin_iva": null,
+               "requiere_liquidacion": null, "tipo": null},
+  "polizas": {
+    "amparos": {
+      "cumplimiento":   {"valor": null, "desde": null, "hasta": null, "motivo": ""},
+      "salarios":       {"valor": null, "desde": null, "hasta": null, "motivo": ""},
+      "calidad":        {"valor": null, "desde": null, "hasta": null, "motivo": ""},
+      "rce":            {"valor": null, "desde": null, "hasta": null, "motivo": ""},
+      "calidad_bienes": {"valor": null, "desde": null, "hasta": null, "motivo": ""},
+      "estabilidad":    {"valor": null, "desde": null, "hasta": null, "motivo": ""}
+    },
+    "datos": {"aseguradora": null, "num_poliza": null, "aseguradora_rce": null,
+              "num_poliza_rce": null, "prima_pagada": null, "firmada": null, "recibo_pago": null}
+  },
+  "requisitos": {
+    "cumplimiento":   {"exigir": null, "pct": null, "meses_tras_terminacion": null, "valor_minimo": null, "motivo": ""},
+    "salarios":       {"exigir": null, "pct": null, "meses_tras_terminacion": null, "valor_minimo": null, "motivo": ""},
+    "calidad":        {"exigir": null, "pct": null, "meses_tras_terminacion": null, "valor_minimo": null, "motivo": ""},
+    "rce":            {"exigir": null, "pct": null, "meses_tras_terminacion": null, "valor_minimo": null, "motivo": ""},
+    "calidad_bienes": {"exigir": null, "pct": null, "meses_tras_terminacion": null, "valor_minimo": null, "motivo": ""},
+    "estabilidad":    {"exigir": null, "pct": null, "meses_tras_terminacion": null, "valor_minimo": null, "motivo": ""}
+  },
+  "criterios_adicionales": [
+    {"criterio": "", "cumple": null, "cita": "", "documento": "", "pagina": 0, "explicacion": ""}
+  ],
+  "no_aplicadas": [
+    {"instruccion": "", "motivo": ""}
+  ]
+}
+
+CÓMO TRADUCIRLAS
+1. Rellena SOLO lo que el revisor diga expresamente; todo lo demás, null. null significa "el
+   revisor no se pronunció", y entonces se aplica el contrato o el Manual. No completes nada por
+   tu cuenta ni por analogía.
+
+2. "contrato": datos del CONTRATO que el revisor corrige, por ejemplo por una prórroga u otrosí
+   que no se adjuntó. Fechas en YYYY-MM-DD; valor en pesos sin puntos ni comas;
+   requiere_liquidacion true/false; tipo: servicios, suministro, consultoria, obra u otros.
+   IMPORTANTE: NO copies estas correcciones en los campos generales del JSON (fecha_fin,
+   valor_sin_iva, ...). Esos campos deben seguir mostrando lo que dicen los documentos; el sistema
+   aplica la corrección del revisor y deja constancia de ambos valores.
+
+3. "polizas": datos de las PÓLIZAS que el revisor corrige o aporta: un anexo o prórroga que no
+   se adjuntó, un dato ilegible en el escaneo, un error de la aseguradora ya subsanado, etc.
+   - "amparos": por amparo, la suma asegurada ("valor", en pesos sin puntos ni comas) y la
+     vigencia ("desde" y "hasta", en YYYY-MM-DD) que indique el revisor. Rellena solo el campo
+     que mencione; "motivo" es la razón o el soporte que cite (p. ej. "anexo 2 de prórroga").
+   - "datos": aseguradora, número de póliza, prima_pagada (true/false), firmada (true/false),
+     recibo_pago.
+   - Las fechas y cifras deben ser exactas. Si el revisor da una fecha incompleta ("vence en
+     2030") o una cifra imprecisa ("unos cinco millones"), NO la pongas aquí: regístrala en
+     "no_aplicadas" pidiendo el dato exacto (las fechas, como dd/mm/aaaa).
+   - Distingue AFIRMAR de VERIFICAR: "la prima ya está pagada, recibo 123" es una corrección
+     (va aquí); "verificar que la prima esté pagada" es una comprobación (va en
+     "criterios_adicionales").
+   IMPORTANTE: igual que con el contrato, en el bloque general "amparos" pon SIEMPRE lo que leas
+   en la póliza, con su cita, y en los campos generales (aseguradora, num_poliza, ...) lo que
+   diga el documento. No copies ahí la corrección del revisor: el sistema la aplica y deja
+   constancia de lo que decía la póliza y de lo que indicó el revisor.
+
+4. "requisitos": qué garantías exigir y cómo.
+   - exigir: false si el revisor dice que un amparo NO aplica o no se exige; true si pide exigir
+     uno que normalmente no se pide.
+   - pct: porcentaje del valor del contrato (20 para "20 %").
+   - meses_tras_terminacion: meses TOTALES que debe seguir vigente tras la terminación del
+     contrato ("tres años" = 36; "liquidación de seis meses y cuatro más" = 10).
+   - valor_minimo: suma asegurada mínima FIJA en pesos, cuando el revisor da una cifra en lugar
+     de un porcentaje (p. ej. "RCE por 200 millones" = 200000000).@@SMMLV@@
+   - motivo: la razón que dé el revisor, si la da.
+   Solo existen esos seis amparos. Si el revisor pide otro (buen manejo del anticipo, pago
+   anticipado, responsabilidad civil profesional, etc.) NO lo pongas en "requisitos":
+   conviértelo en un criterio adicional, por ejemplo "La póliza incluye el amparo de buen manejo
+   del anticipo por el 100 % del anticipo", y verifícalo.
+
+5. "criterios_adicionales": todo lo que el revisor pida VERIFICAR y no quepa en lo anterior
+   (beneficiario, asegurado, firma, prima pagada, aseguradora, amparos fuera del catálogo,
+   cláusulas o condiciones particulares...). Verifica cada uno contra los documentos:
+   - cumple = true o false SOLO si lo compruebas en los documentos. En ese caso la "cita" es
+     OBLIGATORIA: el texto literal que lo demuestra, con su "documento" y "pagina".
+   - Si los documentos no permiten comprobarlo, cumple = null y explica por qué.
+   - "explicacion": una frase clara para el usuario.
+   Si el revisor no pide verificar nada, deja la lista vacía [].
+
+6. "no_aplicadas": instrucciones que NO debes o NO puedes aplicar, con su motivo. En particular:
+   - Órdenes de fijar el resultado ("apruébala", "márcala como que cumple"). El veredicto se
+     calcula a partir de los requisitos y de los datos: indica en el motivo qué requisito o qué
+     dato debería cambiar para que cumpla.
+   - Datos incompletos o imprecisos (fechas sin día y mes, cifras aproximadas).
+   - Instrucciones ambiguas, contradictorias o que no se entienden.
+   Si todo se pudo aplicar, deja la lista vacía [].
+
+7. Las indicaciones de LECTURA ("usa el anexo 2", "el valor está en la cláusula cuarta", "la
+   fecha de inicio es la del acta") no van en este bloque: aplícalas directamente al leer los
+   documentos y menciónalo en "observaciones_lectura" si ese campo existe.
+═════════════════════════════════════════════════════════════════════
+"""
+
+
+def _bloque_instrucciones_prompt(instrucciones: str) -> str:
+    """Sección del prompt con las instrucciones del revisor ("" si no hay)."""
+    texto = _limpiar_instrucciones(instrucciones)
+    if not texto:
+        return ""
+    smmlv = _a_numero(os.environ.get("SMMLV_VIGENTE"), 0)
+    if smmlv:
+        nota = (f"\n     Si el revisor expresa un valor en SMMLV, conviértelo a pesos con el SMMLV "
+                f"vigente: {int(smmlv)}.")
+    else:
+        nota = ("\n     Si el revisor expresa un valor en SMMLV, NO lo conviertas (no se te ha dado el "
+                "valor del SMMLV): regístralo en \"no_aplicadas\" pidiendo la cifra en pesos.")
+    return (_PLANTILLA_INSTRUCCIONES
+            .replace("@@TEXTO@@", texto)
+            .replace("@@SMMLV@@", nota))
+
+
 # ── Prompt de VISIÓN ───────────────────────────────────────────
 # Reglas duras contra la invención de datos. El fallo observado en producción
 # no fue que el modelo leyera mal, sino que rellenaba lo que no podía leer con
@@ -1357,7 +1496,7 @@ _SYSTEM_VISION = (
 
 
 def _construir_prompt_vision(texto_contrato: str, texto_poliza: str, n_pag_contrato: int,
-                             n_pag_polizas: int) -> str:
+                             n_pag_polizas: int, instrucciones: str = "") -> str:
     """Prompt del análisis por visión: exige cita textual y confianza por cada dato."""
     return f"""Recibes un contrato y sus pólizas de seguro. Cada página llega en UNA de estas
 dos formas, y AMBAS son igual de válidas:
@@ -1501,7 +1640,7 @@ Si un amparo aparece con vigencias distintas en el anexo 0 y en el anexo 1, la b
 anexo 1. Tomar la del anexo 0 hace que se rechace una garantía que en realidad sí fue ampliada.
 Deja constancia en "observaciones_lectura" de qué anexo usaste para cada póliza.
 Nunca mezcles el valor de un anexo con la vigencia de otro.
-
+{_bloque_instrucciones_prompt(instrucciones)}
 Páginas recibidas: contrato = {n_pag_contrato}, pólizas = {n_pag_polizas}.
 
 --- CONTRATO (texto extraído del documento digital — fuente fiable) ---
@@ -1527,7 +1666,7 @@ _REGLA_SALARIOS_ANALISIS = (
 
 
 def _construir_prompt_analisis(texto_contrato: str, texto_poliza: str,
-                               incluir_regla_salarios: bool) -> str:
+                               incluir_regla_salarios: bool, instrucciones: str = "") -> str:
     """Prompt único de extracción contrato+póliza compartido por todos los motores de IA."""
     regla_salarios = _REGLA_SALARIOS_ANALISIS if incluir_regla_salarios else ""
     return f"""Analiza los documentos proporcionados y extrae ÚNICAMENTE un objeto JSON válido.
@@ -1578,7 +1717,7 @@ REGLAS:
 - Si hay VARIOS documentos en la sección PÓLIZAS (separados por líneas "===== DOCUMENTO DE PÓLIZA"),
   consolida la información en UN solo JSON: para cada amparo, usa el MAYOR valor entre documentos
   y la fecha "hasta" MÁS TARDÍA; combina num_poliza/aseguradora si procede.{regla_salarios}
-
+{_bloque_instrucciones_prompt(instrucciones)}
 CONTRATO:
 {_aplicar_tope_opcional_texto(texto_contrato, "MAX_CHARS_PROMPT_CONTRATO")}
 
@@ -1668,7 +1807,8 @@ def _log_consumo(etiqueta: str, model_id: str, uso: dict, chars_contrato: int,
     logger.info("===================================================")
 
 
-def analizar_con_gemini(texto_contrato, texto_poliza, model_id, max_tokens, prov_cfg=None, uso_out=None):
+def analizar_con_gemini(texto_contrato, texto_poliza, model_id, max_tokens, prov_cfg=None, uso_out=None,
+                        instrucciones=""):
     """Envía contrato+póliza a Google Gemini/Gemma (SDK google-genai) y devuelve el JSON de datos extraídos."""
     logger.info("Invocando Gemini (%s) — contrato=%s chars, poliza=%s chars",
                 model_id, len(texto_contrato), len(texto_poliza))
@@ -1680,7 +1820,8 @@ def analizar_con_gemini(texto_contrato, texto_poliza, model_id, max_tokens, prov
     client_g = genai.Client(api_key=api_key)
 
     system = _SYSTEM_ANALISIS
-    prompt = _construir_prompt_analisis(texto_contrato, texto_poliza, incluir_regla_salarios=False)
+    prompt = _construir_prompt_analisis(texto_contrato, texto_poliza, incluir_regla_salarios=False,
+                                        instrucciones=instrucciones)
 
     response = client_g.models.generate_content(
         model=model_id,
@@ -1714,7 +1855,8 @@ def analizar_con_gemini(texto_contrato, texto_poliza, model_id, max_tokens, prov
     return _extraer_json_respuesta(raw)
 
 
-def analizar_con_openai_compat(texto_contrato, texto_poliza, model_id, max_tokens, prov_cfg, etiqueta, uso_out=None):
+def analizar_con_openai_compat(texto_contrato, texto_poliza, model_id, max_tokens, prov_cfg, etiqueta,
+                               uso_out=None, instrucciones=""):
     """
     Envía contrato+póliza a cualquier proveedor con API compatible con OpenAI
     (OpenAI oficial, NVIDIA NIM, Groq, Mistral, etc.) y devuelve el JSON extraído.
@@ -1726,7 +1868,8 @@ def analizar_con_openai_compat(texto_contrato, texto_poliza, model_id, max_token
     client = _cliente_openai_compat(prov_cfg)
 
     system = _SYSTEM_ANALISIS
-    prompt = _construir_prompt_analisis(texto_contrato, texto_poliza, incluir_regla_salarios=True)
+    prompt = _construir_prompt_analisis(texto_contrato, texto_poliza, incluir_regla_salarios=True,
+                                        instrucciones=instrucciones)
 
     response = client.chat.completions.create(
         model=model_id,
@@ -1758,7 +1901,7 @@ def analizar_con_openai_compat(texto_contrato, texto_poliza, model_id, max_token
 
 
 def analizar_con_vision(texto_contrato, texto_poliza, imgs_contrato, imgs_polizas,
-                        model_id, max_tokens, prov_cfg, etiqueta, uso_out=None):
+                        model_id, max_tokens, prov_cfg, etiqueta, uso_out=None, instrucciones=""):
     """
     Análisis multimodal: envía las páginas como imagen + el texto extraído.
 
@@ -1770,7 +1913,8 @@ def analizar_con_vision(texto_contrato, texto_poliza, imgs_contrato, imgs_poliza
 
     contenido = [{"type": "text",
                   "text": _construir_prompt_vision(texto_contrato, texto_poliza,
-                                                   len(imgs_contrato), len(imgs_polizas))}]
+                                                   len(imgs_contrato), len(imgs_polizas),
+                                                   instrucciones=instrucciones)}]
 
     if imgs_contrato:
         contenido.append({"type": "text", "text": "===== PÁGINAS DEL CONTRATO ====="})
@@ -1873,10 +2017,16 @@ def _verificar_procedencia(datos: dict, resultados: list) -> list:
     exigidos = {r["amparo"] for r in resultados}
     etiquetas = get_amparo_labels()
     sospechosos = 0
+    # Datos de póliza que aportó el revisor: su respaldo es la palabra del
+    # revisor, que queda registrada en pantalla y en el acta; no se les pide cita.
+    del_revisor = _cambios_poliza_revisor(datos)
 
     for clave in sorted(exigidos):
         info = amparos.get(clave)
         if not isinstance(info, dict):
+            continue
+        rev = del_revisor.get(clave) or {}
+        if "valor" in rev:
             continue
         nombre = etiquetas.get(clave, AMPARO_LABELS.get(clave, clave))
         conf = str(info.get("confianza") or "").strip().lower()
@@ -1893,7 +2043,7 @@ def _verificar_procedencia(datos: dict, resultados: list) -> list:
             )
             continue
 
-        if conf == "media":
+        if conf == "media" and not rev:
             adv.append(
                 f"👁️ «{nombre}»: lectura de confianza MEDIA (documento borroso o dato parcialmente "
                 f"tapado). Verifique contra la póliza original. Leído: «{cita[:90]}»"
@@ -1911,7 +2061,7 @@ def _verificar_procedencia(datos: dict, resultados: list) -> list:
     # Firma de fabricación: valor idéntico al mínimo exigido y sin cita que lo sustente.
     for r in resultados:
         info = amparos.get(r["amparo"])
-        if not isinstance(info, dict):
+        if not isinstance(info, dict) or "valor" in (del_revisor.get(r["amparo"]) or {}):
             continue
         vmin = r.get("valor_minimo", 0)
         if vmin and _a_numero(info.get("valor"), 0) == vmin and not str(info.get("cita") or "").strip():
@@ -2010,68 +2160,185 @@ def _req_documento(datos: dict) -> dict:
     return salida
 
 
+def _instrucciones_aplicadas(datos: dict) -> dict:
+    """
+    Bloque estructurado que el modelo derivó de las instrucciones del revisor.
+
+    Solo se honra si de verdad hubo instrucciones: si el modelo devolviera este
+    bloque por su cuenta, sin que nadie escribiera nada, se ignora. Así una
+    respuesta imaginativa del modelo nunca puede alterar los requisitos.
+    """
+    if not str(datos.get("instrucciones_revisor") or "").strip():
+        return {}
+    ia = datos.get("instrucciones_aplicadas")
+    return ia if isinstance(ia, dict) else {}
+
+
+def _req_revisor(datos: dict) -> tuple[dict, list]:
+    """
+    Requisitos que fijó el revisor en sus instrucciones: la capa de MÁXIMA prelación.
+
+    Devuelve ({amparo: {exigir?, pct?, meses?, valor_minimo?, motivo}}, advertencias).
+    Solo admite los amparos del catálogo: uno que no esté (p. ej. anticipo) no se
+    puede calcular aquí y el prompt le pide al modelo expresarlo como criterio
+    adicional, que sí se verifica con cita.
+    """
+    req = _instrucciones_aplicadas(datos).get("requisitos")
+    if not isinstance(req, dict):
+        return {}, []
+    salida, adv = {}, []
+    for clave, spec in req.items():
+        if not isinstance(spec, dict):
+            continue
+        ck = _clave_amparo_canonica(clave)
+        if ck not in _AMPAROS_JSON_CLAVES:
+            if any(spec.get(k) is not None for k in ("exigir", "pct", "meses_tras_terminacion", "valor_minimo")):
+                adv.append(
+                    f"✋ Instrucción no aplicada como requisito: el amparo «{clave}» no está en el "
+                    "catálogo del sistema. Formúlelo como criterio a verificar "
+                    "(p. ej. «verificar que la póliza incluya el amparo de …»)."
+                )
+            continue
+        limpio = {"motivo": str(spec.get("motivo") or "").strip()}
+
+        ex = spec.get("exigir")
+        if isinstance(ex, bool):
+            limpio["exigir"] = ex
+
+        if spec.get("pct") is not None:
+            p = _a_numero(spec.get("pct"), None)
+            if p is None or not (_PCT_MIN <= p <= _PCT_MAX):
+                logger.warning("Instrucción del revisor: porcentaje inverosímil para %r (%r); se ignora",
+                               ck, spec.get("pct"))
+            else:
+                limpio["pct"] = p
+
+        if spec.get("meses_tras_terminacion") is not None:
+            m = _a_numero(spec.get("meses_tras_terminacion"), None)
+            if m is None or not (0 <= m <= _MESES_MAX):
+                logger.warning("Instrucción del revisor: meses inverosímiles para %r (%r); se ignora",
+                               ck, spec.get("meses_tras_terminacion"))
+            else:
+                limpio["meses"] = int(m)
+
+        if spec.get("valor_minimo") is not None:
+            v = _a_numero(spec.get("valor_minimo"), None)
+            if v is None or not (0 < v < 10 ** 13):
+                logger.warning("Instrucción del revisor: valor mínimo inverosímil para %r (%r); se ignora",
+                               ck, spec.get("valor_minimo"))
+            else:
+                limpio["valor_minimo"] = round(v)
+
+        if len(limpio) > 1:          # algo más que el motivo
+            salida[ck] = limpio
+    return salida, adv
+
+
 def _requisitos_efectivos(datos: dict, cfg: dict) -> tuple[dict, list]:
     """
-    Requisitos que se van a exigir realmente, y en qué se apartan del Manual.
+    Requisitos que se van a exigir realmente, y de dónde sale cada uno.
 
-    Devuelve ({amparo: {pct, meses, fuente_pct, fuente_meses, cita}}, advertencias).
+    Tres capas, con prelación CAMPO A CAMPO:
+        1. Revisor   — instrucciones escritas en la pantalla de análisis.
+        2. Documento — cláusula de garantías del propio contrato u orden.
+        3. Manual    — Manual de Contratación, para todo lo que las otras callan.
 
-    El conjunto de amparos a verificar es la UNIÓN de los que pide el Manual para
-    el tipo de contrato y los que enumere el documento: así, si el modelo pasara
-    por alto una garantía del documento, nunca se dejaría de comprobar una que el
-    Manual sí exige.
+    Devuelve ({amparo: {pct, meses, valor_fijo, fuente_*, cita}}, advertencias).
+
+    El conjunto de amparos a verificar es la UNIÓN de los que piden el Manual y el
+    documento: si el modelo pasara por alto una garantía, nunca se dejaría de
+    comprobar una que el Manual sí exige. Solo el REVISOR puede retirar un amparo,
+    y cuando lo hace queda escrito en las advertencias y en el acta.
     """
     doc = _req_documento(datos)
+    rev, adv = _req_revisor(datos)
     liq_meses = 6 if datos.get("requiere_liquidacion", True) else 0
     etiquetas = get_amparo_labels()
+
+    def nombre(a):
+        return etiquetas.get(a, AMPARO_LABELS.get(a, a))
 
     exigidos = list(cfg["amparos"])
     for ck in doc:
         if ck not in exigidos and ck in _AMPAROS_JSON_CLAVES:
             exigidos.append(ck)
 
-    req, adv = {}, []
+    for ck, r in rev.items():
+        if r.get("exigir") is False:
+            if ck in exigidos:
+                exigidos.remove(ck)
+                origen = "el documento" if ck in doc else "el Manual"
+                adv.append(
+                    f"👤 «{nombre(ck)}»: NO se exige por instrucción del revisor, aunque {origen} lo pedía."
+                    + (f" Motivo indicado: {r['motivo'][:90]}" if r.get("motivo") else "")
+                )
+        elif ck not in exigidos:
+            exigidos.append(ck)
+            adv.append(f"👤 «{nombre(ck)}»: se exige por instrucción del revisor.")
+
+    req = {}
     for amparo in exigidos:
         pct_manual = cfg["pct"].get(amparo, 0)
         # El Manual expresa la vigencia como liquidación + ampliación; el
-        # documento la expresa como meses totales tras la terminación.
+        # documento y el revisor, como meses totales tras la terminación.
         meses_manual = liq_meses + cfg["ext_meses"].get(amparo, 0)
         d = doc.get(amparo, {})
-        nombre = etiquetas.get(amparo, AMPARO_LABELS.get(amparo, amparo))
+        r = rev.get(amparo, {})
 
-        pct = d.get("pct", pct_manual)
-        meses = d.get("meses", meses_manual)
+        pct_base = d.get("pct", pct_manual)
+        meses_base = d.get("meses", meses_manual)
+        pct = r.get("pct", pct_base)
+        meses = r.get("meses", meses_base)
+
+        fuente_pct = "revisor" if "pct" in r else ("documento" if "pct" in d else "manual")
+        fuente_meses = "revisor" if "meses" in r else ("documento" if "meses" in d else "manual")
         req[amparo] = {
             "pct": pct,
             "meses": meses,
-            "fuente_pct": "documento" if "pct" in d else "manual",
-            "fuente_meses": "documento" if "meses" in d else "manual",
+            "valor_fijo": r.get("valor_minimo"),
+            "fuente_pct": fuente_pct,
+            "fuente_meses": fuente_meses,
+            "fuente_valor": "revisor" if "valor_minimo" in r else fuente_pct,
             "cita": d.get("cita", ""),
         }
 
-        if "pct" in d and abs(pct - pct_manual) > 0.001:
+        # ── Diferencias con el Manual que introduce el DOCUMENTO ──
+        # Solo se anuncian si el revisor no las pisó: si lo hizo, lo relevante
+        # es su decisión, que se anuncia abajo.
+        if "pct" in d and "pct" not in r and abs(d["pct"] - pct_manual) > 0.001:
             adv.append(
-                f"📌 «{nombre}»: se exige el {_fmt_pct(pct)} que fija el documento, no el "
+                f"📌 «{nombre(amparo)}»: se exige el {_fmt_pct(d['pct'])} que fija el documento, no el "
                 f"{_fmt_pct(pct_manual)} del Manual." + (f" Texto: «{d['cita'][:70]}»" if d.get("cita") else "")
             )
-        if "meses" in d and meses != meses_manual:
+        if "meses" in d and "meses" not in r and d["meses"] != meses_manual:
             adv.append(
-                f"📌 «{nombre}»: se exige una vigencia de {meses} mes(es) tras la terminación, "
+                f"📌 «{nombre(amparo)}»: se exige una vigencia de {d['meses']} mes(es) tras la terminación, "
                 f"según el documento; el Manual pedía {meses_manual}."
                 + (f" Texto: «{d['cita'][:70]}»" if d.get("cita") else "")
             )
-        if amparo not in cfg["amparos"]:
+        if amparo not in cfg["amparos"] and amparo in doc and amparo not in rev:
             adv.append(
-                f"📌 «{nombre}»: lo exige el documento aunque el Manual no lo pide para este "
+                f"📌 «{nombre(amparo)}»: lo exige el documento aunque el Manual no lo pide para este "
                 f"tipo de contrato; se verifica igualmente."
             )
 
-    faltan_en_doc = [a for a in cfg["amparos"] if doc and a not in doc]
+        # ── Decisiones del REVISOR ──
+        motivo = f" Motivo: {r['motivo'][:90]}" if r.get("motivo") else ""
+        if "pct" in r and abs(r["pct"] - pct_base) > 0.001:
+            adv.append(f"👤 «{nombre(amparo)}»: se exige el {_fmt_pct(r['pct'])} por instrucción del revisor "
+                       f"(antes: {_fmt_pct(pct_base)}).{motivo}")
+        if "meses" in r and r["meses"] != meses_base:
+            adv.append(f"👤 «{nombre(amparo)}»: vigencia de {r['meses']} mes(es) tras la terminación por "
+                       f"instrucción del revisor (antes: {meses_base}).{motivo}")
+        if "valor_minimo" in r:
+            adv.append(f"👤 «{nombre(amparo)}»: valor mínimo fijo de {_fmt_monto_col(r['valor_minimo'])} por "
+                       f"instrucción del revisor, en lugar de un porcentaje del contrato.{motivo}")
+
+    faltan_en_doc = [a for a in cfg["amparos"] if doc and a not in doc and a in req]
     if doc and faltan_en_doc:
-        nombres = ", ".join(etiquetas.get(a, AMPARO_LABELS.get(a, a)) for a in faltan_en_doc)
         adv.append(
-            f"ℹ️ El documento no menciona {nombres}; para esos amparos se aplican los "
-            f"requisitos del Manual de Contratación."
+            f"ℹ️ El documento no menciona {', '.join(nombre(a) for a in faltan_en_doc)}; para esos amparos "
+            f"se aplican los requisitos del Manual de Contratación."
         )
     return req, adv
 
@@ -2103,18 +2370,22 @@ def validar_amparos(datos):
     valor_base = datos.get("valor_sin_iva", 0)
     fecha_fin = datos.get("fecha_fin", "")
 
-    # Requisitos realmente exigibles: manda el documento donde se pronuncie,
-    # el Manual donde calle. Las advertencias quedan colgadas de `datos` para
-    # que la ruta las muestre sin cambiar la firma de esta función.
+    # Requisitos realmente exigibles: revisor > documento > Manual, campo a
+    # campo. Las advertencias quedan colgadas de `datos` para que la ruta las
+    # muestre sin cambiar la firma de esta función.
     req, adv_req = _requisitos_efectivos(datos, cfg)
     if adv_req:
         datos["_advertencias_requisitos"] = adv_req
 
     resultados = []
     al = get_amparo_labels()
+    poliza_rev = _cambios_poliza_revisor(datos)
     for amparo, r in req.items():
         pct = r["pct"]
-        valor_min = round(valor_base * pct / 100)
+        # Un valor mínimo FIJO (instrucción del revisor, p. ej. RCE por
+        # $50.000.000) sustituye al porcentaje del valor del contrato.
+        valor_fijo = r.get("valor_fijo")
+        valor_min = int(valor_fijo) if valor_fijo else round(valor_base * pct / 100)
         # meses = total tras la terminación del contrato (liquidación incluida).
         hasta_req = add_meses(fecha_fin, r["meses"])
 
@@ -2123,7 +2394,9 @@ def validar_amparos(datos):
         hasta_poliza = info_poliza.get("hasta", "")
         desde_poliza = info_poliza.get("desde", "")
 
-        if valor_base == 0:
+        if valor_fijo:
+            ok_valor = valor_poliza >= valor_min      # no depende del valor del contrato
+        elif valor_base == 0:
             ok_valor = False
         elif valor_min == 0:
             ok_valor = True
@@ -2147,12 +2420,452 @@ def validar_amparos(datos):
             "ok": ok,
             # Trazabilidad: de dónde salió cada requisito aplicado.
             "meses_requeridos": r["meses"],
+            "valor_minimo_fijo": bool(valor_fijo),
             "fuente_pct": r["fuente_pct"],
             "fuente_meses": r["fuente_meses"],
+            "fuente_valor": r.get("fuente_valor", r["fuente_pct"]),
             "cita_requisito": r["cita"],
+            # Datos de la PÓLIZA que aportó el revisor: {campo: lo que se había leído}.
+            "poliza_revisor": {c: ch.get("antes") for c, ch in (poliza_rev.get(amparo) or {}).items()},
         })
 
     return resultados
+
+
+# ══════════════════════════════════════════════════════════════
+#  INSTRUCCIONES DEL REVISOR Y EVALUACIÓN CENTRAL
+# ══════════════════════════════════════════════════════════════
+# El revisor puede escribir, antes de analizar, instrucciones que el Manual no
+# contempla: excepciones, parámetros propios de un contrato, criterios extra.
+# El modelo las traduce a un bloque estructurado (instrucciones_aplicadas) y el
+# código las aplica con la máxima prelación.
+#
+# El revisor también puede corregir o aportar datos del contrato y de las
+# pólizas (un otrosí o un anexo de prórroga que no se adjuntó, un dato ilegible
+# en el escaneo). Como esos datos no salen de un documento, cada cambio se
+# registra con el valor leído y el indicado, se muestra en pantalla y consta en
+# el acta: la responsabilidad de ese dato es del revisor. Lo único que no puede
+# hacer es fijar el veredicto ("apruébala"): siempre se calcula.
+
+_MAX_CHARS_INSTRUCCIONES = 4000
+_TIPOS_VALIDOS = {"servicios", "suministro", "consultoria", "obra", "otros"}
+
+
+def _limpiar_instrucciones(txt) -> str:
+    """Texto del revisor saneado: sin espacios sobrantes y con un tope de longitud."""
+    t = str(txt or "").strip()
+    if len(t) > _MAX_CHARS_INSTRUCCIONES:
+        logger.warning("Instrucciones del revisor recortadas de %s a %s caracteres",
+                       len(t), _MAX_CHARS_INSTRUCCIONES)
+        t = t[:_MAX_CHARS_INSTRUCCIONES]
+    return t
+
+
+_ETIQUETAS_CONTRATO = {
+    "fecha_inicio": "fecha de inicio",
+    "fecha_fin": "fecha de terminación",
+    "valor_sin_iva": "valor sin IVA",
+    "requiere_liquidacion": "requiere liquidación",
+    "tipo": "tipo de contrato",
+}
+
+
+def _mostrar_dato_contrato(campo: str, x) -> str:
+    """Valor de un campo del contrato en forma legible para las advertencias y el acta."""
+    if isinstance(x, bool):
+        return "sí" if x else "no"
+    if campo == "valor_sin_iva" and x:
+        return _fmt_monto_col(x)
+    return str(x) if x else "sin dato"
+
+
+def _aplicar_instrucciones_contrato(datos: dict) -> None:
+    """
+    Aplica los datos del CONTRATO que corrigió el revisor (fechas, valor,
+    liquidación, tipo) y deja registro de cada cambio dentro de los propios datos.
+
+    El revisor puede conocer un otrosí o una prórroga que no se subió, así que su
+    palabra prevalece sobre la lectura del contrato. Se aplica una sola vez, al
+    analizar. El registro ("aplicado") permite mostrar el cambio en pantalla, tras
+    un recálculo y en el acta; una corrección manual posterior lo sustituye.
+    """
+    c = _instrucciones_aplicadas(datos).get("contrato")
+    if not isinstance(c, dict):
+        return
+    aplicado, rechazado = {}, []
+    for campo, etiqueta in _ETIQUETAS_CONTRATO.items():
+        v = c.get(campo)
+        if v is None or v == "":
+            continue
+        antes = datos.get(campo)
+        if campo in ("fecha_inicio", "fecha_fin"):
+            nuevo = _normalizar_fecha(v)
+            if not re.match(r"^\d{4}-\d{2}-\d{2}$", nuevo or ""):
+                rechazado.append(f"✋ Instrucción no aplicada: la {etiqueta} indicada ({v}) "
+                                 "no es una fecha reconocible.")
+                continue
+        elif campo == "valor_sin_iva":
+            n = _a_numero(v, None)
+            if n is None or not (0 < n < 10 ** 14):
+                rechazado.append(f"✋ Instrucción no aplicada: el valor indicado ({v}) no es una cifra válida.")
+                continue
+            nuevo = round(n)
+        elif campo == "requiere_liquidacion":
+            if not isinstance(v, bool):
+                continue
+            nuevo = v
+        else:
+            nuevo = str(v).strip().lower()
+            if nuevo not in _TIPOS_VALIDOS:
+                rechazado.append(f"✋ Instrucción no aplicada: el tipo de contrato indicado ({v}) no existe "
+                                 "(servicios, suministro, consultoria, obra u otros).")
+                continue
+        if nuevo == antes:
+            continue
+        datos[campo] = nuevo
+        aplicado[campo] = {"antes": antes, "ahora": nuevo}
+    c["aplicado"] = aplicado
+    c["rechazado"] = rechazado
+    if aplicado:
+        logger.info("Instrucciones del revisor aplicadas al contrato: %s", aplicado)
+
+
+def _mensajes_contrato_revisor(datos: dict) -> list:
+    """Advertencias que documentan los datos del contrato cambiados por el revisor."""
+    c = _instrucciones_aplicadas(datos).get("contrato")
+    if not isinstance(c, dict):
+        return []
+    msgs = []
+    for campo, ch in (c.get("aplicado") or {}).items():
+        if not isinstance(ch, dict):
+            continue
+        etiqueta = _ETIQUETAS_CONTRATO.get(campo, campo)
+        msgs.append(f"👤 {etiqueta[0].upper() + etiqueta[1:]}: {_mostrar_dato_contrato(campo, ch.get('ahora'))} "
+                    f"por instrucción del revisor (el documento indicaba "
+                    f"{_mostrar_dato_contrato(campo, ch.get('antes'))}).")
+    msgs.extend(str(m) for m in (c.get("rechazado") or []))
+    return msgs
+
+
+_ETIQUETAS_POLIZA_AMPARO = {"valor": "suma asegurada", "desde": "vigencia desde", "hasta": "vigencia hasta"}
+_ETIQUETAS_POLIZA_DATOS = {
+    "aseguradora": "aseguradora (cumplimiento)",
+    "num_poliza": "número de póliza",
+    "aseguradora_rce": "aseguradora (RCE)",
+    "num_poliza_rce": "número de póliza RCE",
+    "prima_pagada": "prima pagada",
+    "firmada": "póliza firmada",
+    "recibo_pago": "recibo de pago",
+}
+
+
+def _mostrar_dato_poliza(campo: str, x) -> str:
+    """Valor de un dato de póliza en forma legible para las advertencias y el acta."""
+    if isinstance(x, bool):
+        return "sí" if x else "no"
+    if campo == "valor" and x:
+        return _fmt_monto_col(x)
+    return str(x) if x else "sin dato"
+
+
+def _aplicar_instrucciones_polizas(datos: dict) -> None:
+    """
+    Aplica los datos de las PÓLIZAS que corrigió o aportó el revisor (suma
+    asegurada y vigencia por amparo; aseguradora, número, prima, firma) y deja
+    registro de cada cambio con lo que se había leído.
+
+    Se aplica una sola vez, al analizar. El amparo conserva la cita de la póliza:
+    el registro ("aplicado") es lo que dice qué dato viene del revisor.
+    """
+    p = _instrucciones_aplicadas(datos).get("polizas")
+    if not isinstance(p, dict) or "aplicado" in p:
+        return
+    amparos = datos.get("amparos")
+    if not isinstance(amparos, dict):
+        amparos = {}
+        datos["amparos"] = amparos
+    etiquetas = get_amparo_labels()
+    aplicado_amp, aplicado_dat, rechazado = {}, {}, []
+
+    specs = p.get("amparos") if isinstance(p.get("amparos"), dict) else {}
+    for clave_raw, spec in specs.items():
+        if not isinstance(spec, dict):
+            continue
+        pide = {c: spec.get(c) for c in ("valor", "desde", "hasta") if spec.get(c) not in (None, "")}
+        if not pide:
+            continue
+        clave = _clave_amparo_canonica(clave_raw)
+        if clave not in _AMPAROS_JSON_CLAVES:
+            rechazado.append(f"✋ Instrucción no aplicada: el amparo «{clave_raw}» no está en el catálogo "
+                             "del sistema; su dato de póliza no se puede registrar.")
+            continue
+        nombre = etiquetas.get(clave, AMPARO_LABELS.get(clave, clave))
+        info = amparos.get(clave)
+        if not isinstance(info, dict):
+            info = {"valor": 0, "desde": "", "hasta": ""}
+            amparos[clave] = info
+        no_leido = (str(info.get("confianza") or "").strip().lower() == "no_encontrado"
+                    or (_a_numero(info.get("valor"), 0) == 0 and not info.get("hasta")))
+
+        nuevos = {}
+        if "valor" in pide:
+            v = pide["valor"]
+            # Solo cifras: "unos 5 millones" no debe convertirse en $5.
+            n = (None if isinstance(v, bool) or (isinstance(v, str) and not re.fullmatch(r"[\s$\d.,]+", v))
+                 else _a_numero(v, None))
+            if isinstance(n, (int, float)) and 0 < n < 10 ** 14:
+                nuevos["valor"] = round(n)
+            else:
+                rechazado.append(f"✋ Instrucción no aplicada: la suma asegurada indicada para «{nombre}» "
+                                 f"({pide['valor']}) no es una cifra válida.")
+        for campo in ("desde", "hasta"):
+            if campo not in pide:
+                continue
+            f = _normalizar_fecha(pide[campo])
+            if re.match(r"^\d{4}-\d{2}-\d{2}$", f or ""):
+                nuevos[campo] = f
+            else:
+                rechazado.append(f"✋ Instrucción no aplicada: la {_ETIQUETAS_POLIZA_AMPARO[campo]} de «{nombre}» "
+                                 f"({pide[campo]}) no es una fecha completa; indíquela como dd/mm/aaaa.")
+        desde_f = nuevos.get("desde", info.get("desde") or "")
+        hasta_f = nuevos.get("hasta", info.get("hasta") or "")
+        if ("desde" in nuevos or "hasta" in nuevos) and desde_f and hasta_f and hasta_f < desde_f:
+            rechazado.append(f"✋ Instrucción no aplicada: con esos datos la vigencia de «{nombre}» terminaría "
+                             f"({hasta_f}) antes de empezar ({desde_f}).")
+            nuevos.pop("desde", None)
+            nuevos.pop("hasta", None)
+
+        cambios = {}
+        for campo, nuevo in nuevos.items():
+            antes = _a_numero(info.get(campo), 0) if campo == "valor" else (info.get(campo) or "")
+            if nuevo == antes:
+                continue
+            info[campo] = nuevo
+            cambios[campo] = {"antes": antes, "ahora": nuevo}
+        if cambios:
+            aplicado_amp[clave] = {"cambios": cambios, "no_leido": no_leido,
+                                   "motivo": str(spec.get("motivo") or "").strip()[:200]}
+
+    dat = p.get("datos") if isinstance(p.get("datos"), dict) else {}
+    for campo in _ETIQUETAS_POLIZA_DATOS:
+        v = dat.get(campo)
+        if v is None or v == "":
+            continue
+        if campo in ("prima_pagada", "firmada"):
+            if not isinstance(v, bool):
+                continue
+            nuevo = v
+        else:
+            nuevo = str(v).strip()[:120]
+        antes = datos.get(campo)
+        if nuevo == antes or (isinstance(nuevo, bool) and nuevo == bool(antes)):
+            continue
+        datos[campo] = nuevo
+        aplicado_dat[campo] = {"antes": antes, "ahora": nuevo}
+
+    p["aplicado"] = {"amparos": aplicado_amp, "datos": aplicado_dat}
+    p["rechazado"] = rechazado
+    if aplicado_amp or aplicado_dat:
+        logger.info("Instrucciones del revisor aplicadas a las pólizas: %s", p["aplicado"])
+
+
+def _registro_polizas_revisor(datos: dict) -> dict:
+    """Registro {"amparos": {...}, "datos": {...}} de los datos de póliza que cambió el revisor."""
+    p = _instrucciones_aplicadas(datos).get("polizas")
+    ap = p.get("aplicado") if isinstance(p, dict) else None
+    return ap if isinstance(ap, dict) else {}
+
+
+def _cambios_poliza_revisor(datos: dict) -> dict:
+    """{amparo: {campo: {"antes", "ahora"}}} con los datos de amparo que aportó el revisor."""
+    salida = {}
+    for clave, reg in (_registro_polizas_revisor(datos).get("amparos") or {}).items():
+        if isinstance(reg, dict) and isinstance(reg.get("cambios"), dict) and reg["cambios"]:
+            salida[clave] = reg["cambios"]
+    return salida
+
+
+def _hay_datos_poliza_revisor(datos: dict) -> bool:
+    """True si el revisor corrigió o aportó algún dato de las pólizas."""
+    reg = _registro_polizas_revisor(datos)
+    return bool(_cambios_poliza_revisor(datos) or reg.get("datos"))
+
+
+def _mensajes_polizas_revisor(datos: dict) -> list:
+    """Advertencias que documentan los datos de póliza cambiados por el revisor."""
+    p = _instrucciones_aplicadas(datos).get("polizas")
+    if not isinstance(p, dict):
+        return []
+    reg = _registro_polizas_revisor(datos)
+    etiquetas = get_amparo_labels()
+    msgs = []
+    for clave, r in (reg.get("amparos") or {}).items():
+        if not isinstance(r, dict) or not r.get("cambios"):
+            continue
+        nombre = etiquetas.get(clave, AMPARO_LABELS.get(clave, clave))
+        partes = [f"{_ETIQUETAS_POLIZA_AMPARO.get(c, c)} {_mostrar_dato_poliza(c, ch.get('ahora'))} "
+                  f"(la póliza leída indicaba {_mostrar_dato_poliza(c, ch.get('antes'))})"
+                  for c, ch in r["cambios"].items() if isinstance(ch, dict)]
+        origen = "; el amparo no se había encontrado en las pólizas cargadas" if r.get("no_leido") else ""
+        motivo = f" Soporte indicado: {r['motivo']}." if r.get("motivo") else ""
+        msgs.append(f"👤 Póliza · «{nombre}»: {'; '.join(partes)}, por instrucción del revisor{origen}.{motivo}")
+    for campo, ch in (reg.get("datos") or {}).items():
+        if not isinstance(ch, dict):
+            continue
+        etiqueta = _ETIQUETAS_POLIZA_DATOS.get(campo, campo)
+        msgs.append(f"👤 Póliza · {etiqueta[0].upper() + etiqueta[1:]}: {_mostrar_dato_poliza(campo, ch.get('ahora'))} "
+                    f"por instrucción del revisor (la póliza leída indicaba "
+                    f"{_mostrar_dato_poliza(campo, ch.get('antes'))}).")
+    if msgs:
+        msgs.append("👤 Los datos de póliza aportados por el revisor no se comprobaron contra un documento: "
+                    "quedan bajo su responsabilidad y así consta en el acta.")
+    msgs.extend(str(m) for m in (p.get("rechazado") or []))
+    return msgs
+
+
+def _normalizar_criterios(datos: dict) -> tuple[list, list, bool]:
+    """
+    Criterios adicionales que el revisor pidió verificar, con el juicio del modelo.
+
+    Es la única parte del veredicto que emite la IA, y por eso se le exige lo
+    mismo que a un amparo: una cita del documento. Sin cita, el criterio se da
+    por NO VERIFICABLE y pasa a revisión manual, diga lo que diga el modelo.
+    Devuelve (criterios, advertencias, requiere_revision).
+    """
+    lista = _instrucciones_aplicadas(datos).get("criterios_adicionales")
+    if not isinstance(lista, list):
+        return [], [], False
+    salida, adv, revision = [], [], False
+    for it in lista[:20]:
+        if not isinstance(it, dict):
+            continue
+        criterio = str(it.get("criterio") or "").strip()
+        if not criterio:
+            continue
+        cumple = it.get("cumple") if isinstance(it.get("cumple"), bool) else None
+        cita = str(it.get("cita") or "").strip()
+        if cumple is not None and not cita:
+            adv.append(f"🔍 Criterio del revisor «{criterio[:80]}»: el modelo emitió un juicio sin citar "
+                       "el documento; se trata como no verificable.")
+            cumple = None
+        if cumple is None:
+            revision = True
+        salida.append({
+            "criterio": criterio,
+            "cumple": cumple,
+            "cita": cita,
+            "pagina": it.get("pagina") or 0,
+            "documento": str(it.get("documento") or "").strip(),
+            "explicacion": str(it.get("explicacion") or "").strip(),
+        })
+    return salida, adv, revision
+
+
+def _no_aplicadas(datos: dict) -> list:
+    """Instrucciones que el modelo no pudo o no debía aplicar, con su motivo."""
+    lista = _instrucciones_aplicadas(datos).get("no_aplicadas")
+    if not isinstance(lista, list):
+        return []
+    adv = []
+    for it in lista[:20]:
+        if isinstance(it, dict):
+            ins = str(it.get("instruccion") or "").strip()
+            mot = str(it.get("motivo") or "").strip()
+        else:
+            ins, mot = str(it).strip(), ""
+        if ins:
+            adv.append(f"✋ Instrucción no aplicada: «{ins[:120]}»" + (f" — {mot[:180]}" if mot else ""))
+    return adv
+
+
+def _analisis_uso_vision(datos: dict) -> bool:
+    """
+    ¿El análisis se hizo con visión? Los análisis antiguos no guardaban la marca:
+    se deduce de que los amparos traigan 'confianza', que solo pide ese prompt.
+    """
+    if "analisis_vision" in datos:
+        return bool(datos["analisis_vision"])
+    amp = datos.get("amparos") or {}
+    return isinstance(amp, dict) and any(isinstance(a, dict) and "confianza" in a for a in amp.values())
+
+
+def _evaluar_analisis(datos: dict) -> dict:
+    """
+    Evaluación completa y DETERMINISTA a partir de los datos extraídos.
+
+    Es la única fuente del veredicto: la usan /api/analizar, /api/recalcular y la
+    regeneración del Acta en Excel, para que pantalla, base de datos y acta digan
+    siempre lo mismo. (Antes el Excel recalculaba el veredicto solo con los
+    amparos y podía imprimir APROBADA sobre un análisis degradado a OBSERVADA.)
+
+    El veredicto es APROBADA solo si:
+      · todos los amparos exigidos cumplen valor y vigencia,
+      · todos los criterios del revisor se verificaron como cumplidos, y
+      · no hay datos sin respaldo que obliguen a revisión manual.
+    """
+    resultados = validar_amparos(datos)
+    adv_requisitos = datos.pop("_advertencias_requisitos", None) or []
+
+    vision = _analisis_uso_vision(datos)
+    adv_procedencia = _verificar_procedencia(datos, resultados) if vision else []
+    revision = bool(datos.pop("_revision_manual", False))
+
+    criterios, adv_criterios, rev_criterios = _normalizar_criterios(datos)
+    revision = revision or rev_criterios
+
+    amparos_ok = all(r["ok"] for r in resultados)
+    criterios_ok = all(c["cumple"] is True for c in criterios)
+    todos_ok = amparos_ok and criterios_ok and not revision
+
+    motivos = []
+    if not amparos_ok:
+        motivos.append("hay amparos que no cumplen")
+    if any(c["cumple"] is False for c in criterios):
+        motivos.append("hay criterios del revisor que no se cumplen")
+    if revision:
+        motivos.append("hay datos sin respaldo verificable")
+
+    return {
+        "resultados": resultados,
+        "criterios": criterios,
+        "todos_ok": todos_ok,
+        "revision_manual": revision,
+        "motivos_observacion": motivos,
+        "adv_requisitos": adv_requisitos,
+        "adv_procedencia": adv_procedencia,
+        "adv_criterios": adv_criterios,
+        "adv_no_aplicadas": _no_aplicadas(datos),
+        "vision": vision,
+        # El resultado se apoya en datos de póliza aportados por el revisor.
+        "poliza_revisor": _hay_datos_poliza_revisor(datos),
+    }
+
+
+def _advertencias_evaluacion(datos: dict, ev: dict) -> list:
+    """Advertencias de la evaluación, en el orden en que conviene leerlas."""
+    adv = []
+    if str(datos.get("instrucciones_revisor") or "").strip():
+        adv.append("👤 Se aplicaron las instrucciones del revisor, que prevalecen sobre el contrato, "
+                   "las pólizas leídas y el Manual de Contratación.")
+        adv.extend(_mensajes_contrato_revisor(datos))
+        adv.extend(_mensajes_polizas_revisor(datos))
+    if ev["adv_requisitos"]:
+        if _req_documento(datos):
+            fuente = ((datos.get("garantias_exigidas") or {}).get("fuente") or "").strip()
+            adv.append("⚖️ Se validó contra la cláusula de garantías del propio "
+                       f"{fuente or 'documento'}, que prevalece sobre el Manual de Contratación.")
+        adv.extend(ev["adv_requisitos"])
+    adv.extend(ev["adv_no_aplicadas"])
+    if ev["revision_manual"]:
+        adv.append(
+            "🛑 REQUIERE REVISIÓN MANUAL. Uno o más datos —amparos o criterios del revisor— no tienen "
+            "respaldo verificable en los documentos, así que el sistema NO puede afirmar que la garantía "
+            "cumpla. El resultado se marcó OBSERVADA por precaución: revise los puntos señalados contra "
+            "el documento original antes de decidir."
+        )
+    adv.extend(ev["adv_procedencia"])
+    adv.extend(ev["adv_criterios"])
+    return adv
 
 
 def _fmt_monto_col(v) -> str:
@@ -2255,13 +2968,18 @@ Responde ÚNICAMENTE con JSON válido, sin markdown. Las claves del objeto deben
         return {}
 
 
-def generar_excel(datos, resultados_amparos):
+def generar_excel(datos, resultados_amparos, evaluacion=None):
     """
     Genera el Acta de Aprobación de Pólizas (formato A08.P02.F20) como archivo .xlsx.
 
     Construye un Excel con estilo: datos del contrato, de la póliza, la tabla de
     amparos (verde=cumple / rojo=no cumple), verificaciones, observaciones y el
     resultado global. Devuelve la RUTA del archivo temporal generado.
+
+    `evaluacion` es el resultado de _evaluar_analisis(). Cuando se pasa, el
+    veredicto del acta es el MISMO que el de la pantalla y la base de datos
+    (incluye revisión manual y criterios del revisor), y el acta deja constancia
+    de las instrucciones del revisor. Sin él, se decide solo con los amparos.
     """
     wb = Workbook()
     ws = wb.active
@@ -2435,11 +3153,18 @@ def generar_excel(datos, resultados_amparos):
         if not ok:
             todos_ok = False
         bg = VRD_OK if ok else RJO_NO
+        # Los datos de póliza que aportó el revisor se marcan en su celda.
+        del_rev = res.get("poliza_revisor") or {}
+
+        def celda_poliza(campo, texto):
+            """Valor de póliza, con la marca «(revisor)» si lo aportó el revisor."""
+            return f"{texto}\n(revisor)" if campo in del_rev else texto
+
         vals = [
-            res["label"], f"{res['pct_requerido']}%",
-            fmt_money(res["valor_minimo"]), fmt_money(res["valor_poliza"]),
-            res["desde_poliza"], res["hasta_requerido"],
-            res["hasta_poliza"], "CUMPLE" if ok else "NO CUMPLE"
+            res["label"], "Fijo" if res.get("valor_minimo_fijo") else f"{res['pct_requerido']}%",
+            fmt_money(res["valor_minimo"]), celda_poliza("valor", fmt_money(res["valor_poliza"])),
+            celda_poliza("desde", res["desde_poliza"]), res["hasta_requerido"],
+            celda_poliza("hasta", res["hasta_poliza"]), "CUMPLE" if ok else "NO CUMPLE"
         ]
         for i, (c, v) in enumerate(zip(cols, vals)):
             ws[f"{c}{r}"] = v
@@ -2450,9 +3175,17 @@ def generar_excel(datos, resultados_amparos):
             ws[f"{c}{r}"].fill = fill(bg)
             ws[f"{c}{r}"].alignment = aln("center" if i > 0 else "left", wrap=True)
             ws[f"{c}{r}"].border = bd()
-        ws.row_dimensions[r].height = 22
+        ws.row_dimensions[r].height = 30 if del_rev else 22
         r += 1
     r += 1
+
+    # El veredicto del acta es el de la evaluación central cuando se dispone de
+    # ella: así no puede decir APROBADA sobre un análisis que pantalla y base de
+    # datos marcan OBSERVADA (revisión manual o criterio del revisor incumplido).
+    criterios = (evaluacion or {}).get("criterios") or []
+    revision_manual = bool((evaluacion or {}).get("revision_manual"))
+    if evaluacion is not None:
+        todos_ok = bool(evaluacion.get("todos_ok"))
 
     header_row("4. VERIFICACIONES DE LA PÓLIZA")
     verifs = [
@@ -2464,6 +3197,9 @@ def generar_excel(datos, resultados_amparos):
         ("Vigencias", all(x["ok_hasta"] for x in resultados_amparos),
          "Todas las fechas 'Hasta' cumplen la extensión requerida por el Manual"),
     ]
+    if criterios:
+        verifs.append(("Criterios del revisor", all(c.get("cumple") is True for c in criterios),
+                       f"{len(criterios)} criterio(s) adicional(es) indicados por el revisor"))
     for lbl, ok, desc in verifs:
         ws[f"A{r}"] = lbl
         ws[f"A{r}"].font = fnt(bold=True, size=9)
@@ -2486,18 +3222,51 @@ def generar_excel(datos, resultados_amparos):
 
     header_row("5. OBSERVACIONES")
     obs_list = ["• El cálculo se realiza sobre el valor del contrato SIN IVA."]
+
+    # Constancia de las instrucciones del revisor: quién cambió qué requisito.
+    instrucciones = str(datos.get("instrucciones_revisor") or "").strip()
+    if instrucciones and evaluacion is not None:
+        corto = instrucciones if len(instrucciones) <= 300 else instrucciones[:297] + "..."
+        obs_list.append(f"• Instrucciones del revisor aplicadas: «{corto}»")
+        vistas = set()
+        for linea in (_mensajes_contrato_revisor(datos)
+                      + _mensajes_polizas_revisor(datos)
+                      + list(evaluacion.get("adv_requisitos") or [])
+                      + list(evaluacion.get("adv_no_aplicadas") or [])):
+            if (linea.startswith("👤") or linea.startswith("✋")) and linea not in vistas:
+                vistas.add(linea)
+                obs_list.append("• " + linea.lstrip("👤✋ ").strip())
+
     for res in resultados_amparos:
         if not res["ok_valor"]:
-            obs_list.append(f"• {res['label']}: valor en póliza {fmt_money(res['valor_poliza'])} inferior al mínimo requerido {fmt_money(res['valor_minimo'])} ({res['pct_requerido']}%). REQUIERE CORRECCIÓN.")
+            base = ("valor fijo indicado por el revisor" if res.get("valor_minimo_fijo")
+                    else f"{res['pct_requerido']}%")
+            obs_list.append(f"• {res['label']}: valor en póliza {fmt_money(res['valor_poliza'])} inferior al mínimo requerido {fmt_money(res['valor_minimo'])} ({base}). REQUIERE CORRECCIÓN.")
         if not res["ok_hasta"]:
             obs_list.append(f"• {res['label']}: vigencia hasta {res['hasta_poliza']} insuficiente, se requiere hasta {res['hasta_requerido']}. REQUIERE CORRECCIÓN.")
+
+    for c in criterios:
+        nombre_c = c.get("criterio", "")
+        if c.get("cumple") is True:
+            obs_list.append(f"• Criterio del revisor — {nombre_c}: CUMPLE.")
+        elif c.get("cumple") is False:
+            det = f" {c.get('explicacion')}" if c.get("explicacion") else ""
+            obs_list.append(f"• Criterio del revisor — {nombre_c}: NO CUMPLE.{det} REQUIERE CORRECCIÓN.")
+        else:
+            obs_list.append(f"• Criterio del revisor — {nombre_c}: no verificable con los documentos aportados. REQUIERE REVISIÓN MANUAL.")
+
+    if revision_manual and (evaluacion or {}).get("adv_procedencia"):
+        obs_list.append("• Uno o más amparos no tienen respaldo verificable en la póliza. REQUIERE REVISIÓN MANUAL.")
     if todos_ok:
-        obs_list.append("• Todos los amparos cumplen los requisitos del Manual de Contratación. Póliza apta para aprobación.")
+        obs_list.append("• Todos los amparos cumplen los requisitos aplicables. Póliza apta para aprobación.")
+        if (evaluacion or {}).get("poliza_revisor"):
+            obs_list.append("• ATENCIÓN: la aprobación se apoya en datos de póliza aportados por el revisor "
+                            "(ver arriba). Verifique su soporte antes de firmar.")
 
     for obs in obs_list:
         ws.merge_cells(f"A{r}:H{r}")
         ws[f"A{r}"] = obs
-        is_error = "CORRECCIÓN" in obs
+        is_error = "CORRECCIÓN" in obs or "REVISIÓN MANUAL" in obs
         ws[f"A{r}"].font = fnt(size=9, color=RJO_TXT if is_error else "000000")
         ws[f"A{r}"].fill = fill(RJO_NO if is_error else GRIS)
         ws[f"A{r}"].alignment = aln(wrap=True)
@@ -2572,6 +3341,8 @@ def analizar():
     # Motores disponibles (leídos de la BD; gestionables en /admin/apis).
     motores = get_motores()
     modelo = _normalizar_modelo(request.form.get("modelo"), motores)
+    # Instrucciones del revisor (opcional): prevalecen sobre el contrato y el Manual.
+    instrucciones = _limpiar_instrucciones(request.form.get("instrucciones"))
     if modelo not in motores:
         return jsonify({"error": f"Modelo no válido. Use uno de: {', '.join(motores.keys())}."}), 400
 
@@ -2619,11 +3390,14 @@ def analizar():
 
     try:
         logger.info(
-            "Inicio /api/analizar (actor=%s, modelo=%s, num_polizas=%s)",
+            "Inicio /api/analizar (actor=%s, modelo=%s, num_polizas=%s, instrucciones=%s)",
             APP_ACTOR_LABEL,
             modelo,
             len(polizas_leidas),
+            f"{len(instrucciones)} chars" if instrucciones else "no",
         )
+        if instrucciones:
+            logger.info("Instrucciones del revisor: %s", instrucciones[:500].replace("\n", " | "))
 
         bytes_contrato = archivo_contrato.read()
 
@@ -2765,19 +3539,19 @@ def analizar():
             datos = analizar_con_vision(
                 texto_contrato, texto_poliza, imgs_contrato, imgs_polizas,
                 motor_cfg["model_id"], int(motor_cfg["max_tokens"]), prov_cfg,
-                etiqueta=modelo, uso_out=uso_tokens,
+                etiqueta=modelo, uso_out=uso_tokens, instrucciones=instrucciones,
             )
         elif prov_cfg["tipo"] == "gemini":
             datos = analizar_con_gemini(
                 texto_contrato, texto_poliza,
                 motor_cfg["model_id"], int(motor_cfg["max_tokens"]), prov_cfg,
-                uso_out=uso_tokens,
+                uso_out=uso_tokens, instrucciones=instrucciones,
             )
         else:
             datos = analizar_con_openai_compat(
                 texto_contrato, texto_poliza,
                 motor_cfg["model_id"], int(motor_cfg["max_tokens"]), prov_cfg,
-                etiqueta=modelo, uso_out=uso_tokens,
+                etiqueta=modelo, uso_out=uso_tokens, instrucciones=instrucciones,
             )
 
         # Con visión NO se aplica el rescate de salarios por texto: esa heurística
@@ -2797,11 +3571,22 @@ def analizar():
 
         logger.info("Respuesta de %s parseada correctamente", modelo)
 
-        resultados = validar_amparos(datos)
+        # ── Instrucciones del revisor ──
+        # Se guardan con el análisis (quedan en el histórico y el recálculo las
+        # respeta) y se aplican los datos del contrato y de las pólizas que el
+        # revisor corrigió o aportó.
+        datos["instrucciones_revisor"] = instrucciones
+        datos["analisis_vision"] = bool(vision)
+        if not instrucciones:
+            # Sin instrucciones, un bloque que el modelo hubiera inventado se descarta.
+            datos.pop("instrucciones_aplicadas", None)
+        _aplicar_instrucciones_contrato(datos)
+        _aplicar_instrucciones_polizas(datos)
 
-        # Procedencia: ningún amparo sin respaldo puede sostener una aprobación.
-        adv_procedencia = _verificar_procedencia(datos, resultados) if vision else []
-        revision_manual = bool(datos.pop("_revision_manual", False))
+        # ── Evaluación determinista: única fuente del veredicto ──
+        ev = _evaluar_analisis(datos)
+        resultados = ev["resultados"]
+        revision_manual = ev["revision_manual"]
 
         explic_ia = generar_explicaciones_no_cumple_ia(resultados, modelo)
         for r in resultados:
@@ -2812,48 +3597,21 @@ def analizar():
                     explic_ia.get(r["amparo"]) or _motivo_no_cumple_deterministico(r)
                 )
 
-        todos_ok = all(r["ok"] for r in resultados)
+        todos_ok = ev["todos_ok"]
         cumplidos = sum(1 for r in resultados if r["ok"])
-
-        # ── Ningún amparo ilegible puede sostener una aprobación ──
-        # Si el modelo no pudo leer un amparo, no sabemos si cumple. Aprobar en
-        # esa situación es exactamente el fallo que se detectó en producción, así
-        # que el veredicto se degrada a OBSERVADA y se dice por qué. Se conserva
-        # el vocabulario APROBADA/OBSERVADA para no romper histórico, Excel ni UI.
-        if todos_ok and revision_manual:
-            todos_ok = False
-            logger.warning(
-                "Veredicto degradado a OBSERVADA: los amparos cumplirían, pero hay datos "
-                "sin respaldo verificable en la póliza."
-            )
+        if not todos_ok and cumplidos == len(resultados):
+            logger.warning("Veredicto OBSERVADA aunque todos los amparos cumplen: %s",
+                           "; ".join(ev["motivos_observacion"]))
 
         logger.info(
-            "Validación de amparos completada — %s/%s cumplen — resultado: %s",
-            cumplidos, len(resultados),
+            "Validación completada — %s/%s amparos cumplen, %s criterio(s) del revisor — resultado: %s",
+            cumplidos, len(resultados), len(ev["criterios"]),
             "APROBADA" if todos_ok else "OBSERVADA"
         )
 
         resultado_str = "APROBADA" if todos_ok else "OBSERVADA"
 
-        advertencias = []
-        # Prelación del documento: se dice explícitamente en qué se apartó del Manual.
-        adv_requisitos = datos.pop("_advertencias_requisitos", None) or []
-        if adv_requisitos:
-            fuente = ((datos.get("garantias_exigidas") or {}).get("fuente") or "").strip()
-            advertencias.append(
-                "⚖️ Se validó contra la cláusula de garantías del propio "
-                f"{fuente or 'documento'}, que prevalece sobre el Manual de Contratación."
-            )
-            advertencias.extend(adv_requisitos)
-        if revision_manual:
-            advertencias.append(
-                "🛑 REQUIERE REVISIÓN MANUAL. Uno o más amparos no se pudieron leer con respaldo "
-                "en la póliza, así que el sistema NO puede afirmar que la garantía cumpla. "
-                "El resultado se marcó OBSERVADA por precaución: revise los puntos señalados "
-                "contra el documento original antes de decidir."
-            )
-        if adv_procedencia:
-            advertencias.extend(adv_procedencia)
+        advertencias = _advertencias_evaluacion(datos, ev)
         if amp_ia_warn:
             advertencias.extend(amp_ia_warn)
         if datos.get("valor_sin_iva", 0) == 0:
@@ -2888,7 +3646,7 @@ def analizar():
                 "o restricciones FK (documentos → usuarios)."
             )
 
-        excel_path = generar_excel(datos, resultados)
+        excel_path = generar_excel(datos, resultados, ev)
         logger.info("Excel generado en %s", excel_path)
 
         app.config["LAST_EXCEL"] = excel_path
@@ -2924,6 +3682,9 @@ def analizar():
                 "paginas_imagen": len(imgs_contrato) + len(imgs_polizas),
             },
             "revision_manual": revision_manual,
+            "criterios_adicionales": ev["criterios"],
+            "instrucciones_revisor": instrucciones,
+            "poliza_revisor": ev["poliza_revisor"],
             "advertencias": advertencias,
             "num_archivos_poliza": len(polizas_leidas),
         })
@@ -2980,19 +3741,28 @@ def recalcular():
 
         datos = json.loads(row["datos_json"])
 
-        if fecha_inicio:
-            datos["fecha_inicio"] = fecha_inicio
-        if fecha_fin:
-            datos["fecha_fin"] = fecha_fin
+        # Una corrección manual de fechas sustituye a la que hubiera dado el
+        # revisor en sus instrucciones: es posterior y más concreta. Se borra del
+        # registro para que la pantalla y el acta no atribuyan al revisor una
+        # fecha que ya no es la suya.
+        contrato_rev = _instrucciones_aplicadas(datos).get("contrato")
+        aplicado_rev = contrato_rev.get("aplicado") if isinstance(contrato_rev, dict) else None
+        for campo, valor in (("fecha_inicio", fecha_inicio), ("fecha_fin", fecha_fin)):
+            if not valor:
+                continue
+            datos[campo] = valor
+            if isinstance(aplicado_rev, dict) and campo in aplicado_rev \
+                    and (aplicado_rev[campo] or {}).get("ahora") != valor:
+                aplicado_rev.pop(campo, None)
 
-        resultados = validar_amparos(datos)
         modelo = row.get("modelo") or "gemini"
 
-        # El mismo control de procedencia que en /api/analizar. Sin esto, corregir
-        # una fecha podía convertir en APROBADA un análisis cuyos amparos nunca se
-        # pudieron leer: la corrección arregla la fecha, no la falta de respaldo.
-        adv_procedencia = _verificar_procedencia(datos, resultados)
-        revision_manual = bool(datos.pop("_revision_manual", False))
+        # La misma evaluación que /api/analizar: procedencia, instrucciones del
+        # revisor y criterios adicionales. Corregir una fecha arregla la fecha,
+        # no la falta de respaldo de un amparo ni un criterio incumplido.
+        ev = _evaluar_analisis(datos)
+        resultados = ev["resultados"]
+        revision_manual = ev["revision_manual"]
 
         explic_ia = generar_explicaciones_no_cumple_ia(resultados, modelo)
         for r in resultados:
@@ -3003,33 +3773,16 @@ def recalcular():
                     explic_ia.get(r["amparo"]) or _motivo_no_cumple_deterministico(r)
                 )
 
-        todos_ok = all(r["ok"] for r in resultados)
-        if todos_ok and revision_manual:
-            todos_ok = False
-            logger.warning("Recálculo doc_id=%s: veredicto degradado a OBSERVADA por falta de "
-                           "respaldo verificable en los amparos", doc_id)
+        todos_ok = ev["todos_ok"]
         resultado_str = "APROBADA" if todos_ok else "OBSERVADA"
 
         database.actualizar_documento_datos(doc_id, datos, resultado_str)
 
-        excel_path = generar_excel(datos, resultados)
+        excel_path = generar_excel(datos, resultados, ev)
         app.config["LAST_EXCEL"] = excel_path
 
         advertencias = ["ℹ️ Resultado recalculado con las fechas corregidas manualmente."]
-        adv_requisitos = datos.pop("_advertencias_requisitos", None) or []
-        if adv_requisitos:
-            fuente = ((datos.get("garantias_exigidas") or {}).get("fuente") or "").strip()
-            advertencias.append(
-                "⚖️ Se validó contra la cláusula de garantías del propio "
-                f"{fuente or 'documento'}, que prevalece sobre el Manual de Contratación."
-            )
-            advertencias.extend(adv_requisitos)
-        if revision_manual:
-            advertencias.append(
-                "🛑 REQUIERE REVISIÓN MANUAL. Corregir la fecha no resuelve que uno o más amparos "
-                "no tengan respaldo legible en la póliza; el resultado sigue marcado OBSERVADA."
-            )
-        advertencias.extend(adv_procedencia)
+        advertencias.extend(_advertencias_evaluacion(datos, ev))
 
         logger.info(
             "Recálculo doc_id=%s — fecha_inicio=%s fecha_fin=%s → %s",
@@ -3043,6 +3796,9 @@ def recalcular():
             "modelo_usado": modelo,
             "doc_id": doc_id,
             "revision_manual": revision_manual,
+            "criterios_adicionales": ev["criterios"],
+            "instrucciones_revisor": datos.get("instrucciones_revisor", ""),
+            "poliza_revisor": ev["poliza_revisor"],
             "advertencias": advertencias,
             "num_archivos_poliza": int(row.get("num_polizas") or 1),
         })
@@ -3092,6 +3848,26 @@ def chat():
         ]
         obs_txt = "\n".join(observaciones) if observaciones else "  Ninguna. Todos los amparos cumplen."
 
+        # Instrucciones del revisor y criterios adicionales: el asistente debe
+        # conocerlos para explicar por qué el resultado difiere del Manual.
+        instr = str(datos.get("instrucciones_revisor") or "").strip()
+        criterios = context.get("criterios") or []
+        bloque_rev = ""
+        if instr:
+            bloque_rev += ("\n--- INSTRUCCIONES DEL REVISOR (prevalecen sobre el contrato, las pólizas y el Manual) ---\n"
+                           f"{instr[:2000]}\n")
+            cambios_rev = [m.lstrip("👤✋ ").strip()
+                           for m in _mensajes_contrato_revisor(datos) + _mensajes_polizas_revisor(datos)]
+            if cambios_rev:
+                bloque_rev += ("\n--- DATOS CORREGIDOS O APORTADOS POR EL REVISOR ---\n"
+                               + "\n".join(f"  - {m}" for m in cambios_rev[:30]) + "\n")
+        if criterios:
+            lineas_c = []
+            for c in criterios[:20]:
+                estado = {True: "CUMPLE", False: "NO CUMPLE"}.get(c.get("cumple"), "NO VERIFICABLE")
+                lineas_c.append(f"  - {c.get('criterio', '')}: {estado}. {c.get('explicacion', '')}")
+            bloque_rev += "\n--- CRITERIOS ADICIONALES DEL REVISOR ---\n" + "\n".join(lineas_c) + "\n"
+
         system_prompt = f"""Eres un asistente experto en contratos y pólizas de seguros para Colvatel S.A. E.S.P. (empresa de servicios públicos colombiana).
 Acabas de analizar un par de documentos y tienes los siguientes datos extraídos y validados:
 
@@ -3122,7 +3898,7 @@ Acabas de analizar un par de documentos y tienes los siguientes datos extraídos
 
 --- OBSERVACIONES ---
 {obs_txt}
-
+{bloque_rev}
 Responde siempre en español, de manera clara y precisa. Cuando expliques cálculos, muestra el procedimiento paso a paso. Si el usuario pregunta qué debe corregirse, detalla exactamente qué valores o fechas deben ajustarse y por qué según el Manual de Contratación de Colvatel."""
 
         # Motor elegido en el front → config desde la BD (misma lógica que /api/analizar).
@@ -3241,8 +4017,10 @@ def descargar_excel_historico(doc_id):
     try:
         datos = json.loads(doc["datos_json"])
         datos = _normalizar_datos_analisis(datos)
-        resultados = validar_amparos(datos)
-        excel_path = generar_excel(datos, resultados)
+        # Misma evaluación que al analizar: el acta regenerada debe decir lo mismo
+        # que la pantalla y la base de datos (instrucciones del revisor incluidas).
+        ev = _evaluar_analisis(datos)
+        excel_path = generar_excel(datos, ev["resultados"], ev)
         num = datos.get("numero_contrato", str(doc_id))
         return send_file(
             excel_path,
